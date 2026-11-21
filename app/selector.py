@@ -1045,6 +1045,7 @@ EXEC_SIDE = ("sqlglot/executor/", "sqlglot/planner.py", "sqlglot/generators/pyth
              "tests/test_executor.py", "tests/test_optimizer.py", "tests/helpers.py", "tests/fixtures/optimizer/tpc-")
 EXEC_TPCH = "tests/test_executor.py::TestExecutor::test_execute_tpch"
 EXEC_TPCDS = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+OPT_TPCH = "tests/test_optimizer.py::TestOptimizer::test_tpch"
 _ID2NUM = {}
 
 
@@ -1127,8 +1128,19 @@ def _next_phase(c, ms, ids):
                 if eh in c.failed:
                     proxy_p[ex] = 0.97
                     continue
-                p_ok, p_bad = 0.02, 0.6
-                proxy_p[ex] = 0.07
+                oh = _num(ids, OPT_TPCH)
+                if oh is not None and oh in c.cheap and oh not in fx:
+                    # optimizer test_tpch also ran: failed -> tpcds failed 3/3; passed -> 3/99
+                    # (then test_tpcds passed: 2/95, failed: 1/4)
+                    if oh in c.failed:
+                        p_ok, p_bad = 0.3, 0.9
+                        proxy_p[ex] = 0.8
+                    else:
+                        p_ok, p_bad = 0.021, 0.3
+                        proxy_p[ex] = 0.03
+                else:
+                    p_ok, p_bad = 0.02, 0.6
+                    proxy_p[ex] = 0.07
             if px in c.cheap:
                 proxy_p[ex] = p_bad if px in c.failed else p_ok
             elif px in c.exp and px not in fx:
