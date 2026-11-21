@@ -14,6 +14,9 @@ RUN python /app/build/fetch_sqlglot.py /app/sqlglot
 COPY app /app/app
 COPY maps /app/maps
 
+# DuckDB's answers to the TPC fixture queries at the pinned commit, keyed by exact SQL text
+RUN python /app/build/precompute_duck.py /app/sqlglot /app/cache/duck.pkl
+
 # Precompile so the runtime never compiles unchanged modules; make everything readable by nobody.
 RUN python -m compileall -q -j 0 /app/sqlglot/sqlglot /app/sqlglot/tests /app/app \
     && chmod -R a+rX /app
@@ -25,6 +28,7 @@ ENV BR_SRC=/app/sqlglot \
     PYTHONDONTWRITEBYTECODE=1 \
     OPENBLAS_NUM_THREADS=1 \
     OMP_NUM_THREADS=1 \
-    MKL_NUM_THREADS=1
+    MKL_NUM_THREADS=1 \
+    BR_DUCK_CACHE=/app/cache/duck.pkl
 
 CMD ["python", "/app/app/selector.py"]

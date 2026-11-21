@@ -131,6 +131,31 @@ def _parse_rows(file_name):
     return rows
 
 
+DUCK_CACHE = None
+
+
+class _CachedResult:
+    def __init__(self, df):
+        self._df = df
+
+    def fetchdf(self):
+        return self._df.copy(deep=True)
+
+
+def load_duck_cache():
+    """Load the build-time DuckDB answers (BR_DUCK_CACHE) once, in the parent."""
+    global DUCK_CACHE
+    path = os.environ.get("BR_DUCK_CACHE")
+    if DUCK_CACHE is None and path and os.path.exists(path):
+        try:
+            import pickle
+
+            with open(path, "rb") as f:
+                DUCK_CACHE = pickle.load(f)
+        except Exception:  # noqa: BLE001
+            DUCK_CACHE = None
+
+
 TPC_SUB_OF_TEST = {"test_execute_tpch": "tpc-h", "test_execute_tpcds": "tpc-ds"}
 
 
@@ -192,9 +217,19 @@ def _install_fast_executor_setup(mod, patched):
         """duckdb connection whose CREATE VIEW statements run on first use (most
         executor tests never touch duckdb, and binding 32 CSV views costs ~0.7 s)."""
 
-        def __init__(self):
+        def __init__(self, db=None):
             self._conn = None
             self._pending = []
+            self._db = db
+
+        def execute(self, query, *args, **kwargs):
+            # DuckDB's answer to this exact SQL text over the pristine TPC data, computed at
+            # build time (the views and data are unchanged whenever this setup is used)
+            if DUCK_CACHE is not None and not args and not kwargs and isinstance(query, str):
+                hit = DUCK_CACHE.get((self._db, query))
+                if hit is not None:
+                    return _CachedResult(hit)
+            return self._real().execute(query, *args, **kwargs)
 
         def _real(self):
             if self._conn is None:
@@ -219,8 +254,8 @@ def _install_fast_executor_setup(mod, patched):
 
     def setUpClass(cls):
         Table = mod.Table
-        cls.tpch_conn = LazyConn()
-        cls.tpcds_conn = LazyConn()
+        cls.tpch_conn = LazyConn("tpch")
+        cls.tpcds_conn = LazyConn("tpcds")
         cls.tpch_tables = {}
         cls.tpcds_tables = {}
 

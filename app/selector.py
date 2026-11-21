@@ -943,6 +943,7 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
     if any(meta[t][1] == "tests/test_executor.py" and meta[t][2] == "TestExecutor" for c in jobs for t in c.cheap | c.exp):
         try:
             runner.precompute_executor_rows(SRC, subs=())  # rows are parsed when a test needs them
+            runner.load_duck_cache()
         except Exception as e:  # noqa: BLE001
             log("precompute failed", repr(e))
 
@@ -1267,7 +1268,7 @@ def _next_phase(c, ms, ids):
         for x in c.exp:
             q = policy.EXEC_QUIET.get(ids[x].rsplit("::", 1)[-1])
             if q is not None and x not in fx:
-                proxy_p[x] = q
+                proxy_p[x] = min(q, policy.prob(ids[x], regime, n_cheap, x in c.dedicated))
     c.proxy_probs = {}
     eh_, oh_ = _num(ids, EXEC_TPCH), _num(ids, OPT_TPCH)
     tpc_ok = any(g is not None and g in c.cheap and g in c.reported and g not in c.failed for g in (eh_, oh_))
