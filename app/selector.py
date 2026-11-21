@@ -721,6 +721,11 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
         except Exception as e:  # noqa: BLE001
             log("precompute failed", repr(e))
 
+    if os.environ.get("BR_GC_FREEZE", "1") == "1":
+        import gc
+
+        gc.collect()
+        gc.freeze()  # children start with the parent's objects outside the cyclic collector
     pending = []
     for c in jobs:
         c.failed = set()
@@ -755,7 +760,10 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
                 import zlib as _z
 
                 # deterministic shuffle of test classes: early results then represent the whole set
-                tl = [meta[t] for t in sorted(tests, key=lambda t: (_z.crc32(f"{meta[t][1]}::{meta[t][2]}".encode()), meta[t][1], meta[t][2]))]
+                if os.environ.get("BR_NO_SHUFFLE"):
+                    tl = [meta[t] for t in sorted(tests)]  # collection order (validation runs)
+                else:
+                    tl = [meta[t] for t in sorted(tests, key=lambda t: (_z.crc32(f"{meta[t][1]}::{meta[t][2]}".encode()), meta[t][1], meta[t][2]))]
                 tm = float(os.environ.get("BR_TIMEOUT_MULT", "5"))
                 timeouts = {t: min(float(os.environ.get("BR_TIMEOUT_CAP", "45")), max(5.0, ms[t] / 1000 * tm + 3)) for t in tests}
                 runner.TPC_FILTER = getattr(c, "tpc_filter", None)
@@ -1025,3 +1033,7 @@ def _preload(files):
 
 if __name__ == "__main__":
     main()
+    # skip interpreter teardown (frozen objects are never freed; nothing is left to clean up)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

@@ -29,10 +29,17 @@ packed onto the cheapest number of workers.
    all needed test modules (like pytest collection) and runs the candidate tests with
    `unittest`. Every test reported failed, or never reported, is included; a test file that
    cannot be imported fails all of its tests and every file importing the patched module.
-3. Expensive tests (>= 1 s) are decided by expected cost, using how many cheap candidates
-   failed (catastrophic / broad / narrow / none) and probabilities measured on clean synthetic
-   single-line mutants of the pinned commit (`tools/campaign.py`, `tools/validate.py`).
-   A change that breaks almost everything stops early and includes all candidates.
+3. Expensive tests (>= 1 s) are decided by expected cost (run it, include it unrun, or leave
+   it out), using how many cheap candidates failed (catastrophic / broad / narrow / none) and,
+   in the narrow case, whether cheap tests of the expensive test's own class failed.
+   Probabilities come from clean synthetic single-line mutants of the pinned commit
+   (`tools/campaign.py`, `tools/validate.py`). A change that breaks almost everything stops
+   early and includes all candidates.
+   The two slowest tests have cheap stand-ins that run their own checks in the child:
+   `test_generator_memory` (same loop and leak threshold, with pre-existing objects frozen out
+   of the cyclic GC so its `gc.collect()` calls are cheap) and `test_max_nodes` (the same
+   node-limit checks at 1/100 scale). A failed stand-in includes the test; a passed one leaves
+   it out. They are not used when the test's own file is edited.
 4. Output: the failing tests, packed by LPT over 1..8 workers to minimise
    busiest worker + 2 s per worker.
 
