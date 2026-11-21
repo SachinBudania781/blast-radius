@@ -967,6 +967,11 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
                     tl = [meta[t] for t in sorted(tests)]  # collection order (validation runs)
                 else:
                     tl = [meta[t] for t in sorted(tests, key=lambda t: (_z.crc32(f"{meta[t][1]}::{meta[t][2]}".encode()), meta[t][1], meta[t][2]))]
+                if phase == 1 and (getattr(c, "early_blind", None) or len(tests) >= 40):
+                    # tests named after a patched module first: an early failure stops sooner
+                    stems = {os.path.basename(p)[:-3] for p in c.patched if p.endswith(".py")} - {"__init__", "dialect", "base", "core"}
+                    if stems:
+                        tl = [m for m in tl if any(st in os.path.basename(m[1]) for st in stems)] + [m for m in tl if not any(st in os.path.basename(m[1]) for st in stems)]
                 gate = (getattr(c, "early_gate", None) or set()) if phase == 1 else set()
                 if phase == 1 and ids is not None and _num(ids, EXEC_TPCDS) in c.exp:
                     # the cheap TPC tests first: their result decides the TPC-DS run
