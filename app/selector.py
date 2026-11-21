@@ -35,6 +35,8 @@ PAR = int(os.environ.get("BR_PAR", "2"))
 DEBUG = os.environ.get("BR_DEBUG") == "1"
 VERIFY_ALL = os.environ.get("BR_VERIFY_ALL") == "1"  # measurement mode (never include unverified, except catastrophic)
 
+# tests with a cheap stand-in in runner.PROBES
+PROBE_IDS = ("tests/test_generator.py::TestGenerator::test_generator_memory", "tests/test_parser.py::TestParser::test_max_nodes")
 EXPENSIVE = 1.0  # recorded seconds at or above which a test is "expensive"
 # wall-clock budget for the whole batch (the scorer allows 180 s for ~40 commits, 270 s for ~60)
 DEADLINE = time.time() + float(os.environ.get("BR_BUDGET", "0") or 0)
@@ -646,6 +648,8 @@ def main():
         exp_ = cand - cheap
         c.cheap, c.exp = cheap, exp_
         c.run_ms = run_ms
+        # cheap stand-ins for the slowest tests, run after the cheap ones
+        c.probes = [] if VERIFY_ALL else [(x, tests[x]["id"]) for x in sorted(exp_) if tests[x]["id"] in PROBE_IDS]
         if not VERIFY_ALL and cheap and policy.CPU_RATIO * sum(run_ms.get(t, ms[t]) for t in cheap) > policy.pack_cost(cheap | exp_ | c.sure | c.always, ms):
             # running them would cost more than just including them
             if not c.import_check:
@@ -654,6 +658,7 @@ def main():
             # but first make sure the patched modules import (else far more tests fail)
             c.include_all_after_import = cheap | exp_
             c.cheap, c.exp = set(), set()
+            c.probes = []
         if not cheap and not exp_ and not c.import_check:
             c.result = set(c.always) | c.sure
             continue
@@ -661,7 +666,7 @@ def main():
 
     ids = [t["id"] for t in tests]
     for c in jobs:
-        c.early_blind = None if VERIFY_ALL else policy.early_stop_ok(c.cheap, c.exp, ms, ids, getattr(c, "run_ms", None), c.dedicated)
+        c.early_blind = None if (VERIFY_ALL or c.probes) else policy.early_stop_ok(c.cheap, c.exp, ms, ids, getattr(c, "run_ms", None), c.dedicated)
     try:
         run_jobs(jobs, meta, ms, maps, ids)
     except BaseException as e:  # noqa: BLE001
@@ -751,7 +756,7 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
                 timeouts = {t: min(float(os.environ.get("BR_TIMEOUT_CAP", "45")), max(5.0, ms[t] / 1000 * tm + 3)) for t in tests}
                 runner.TPC_FILTER = getattr(c, "tpc_filter", None)
                 runner.OPT_FILTER = getattr(c, "opt_filter", None)
-                runner.child_main(ov, tl, w, timeouts, 0, sorted(m for m in c.import_check if m.startswith("sqlglot/") or m.startswith("tests/")), set(c.patched) | set(c.deleted))
+                runner.child_main(ov, tl, w, timeouts, 0, sorted(m for m in c.import_check if m.startswith("sqlglot/") or m.startswith("tests/")), set(c.patched) | set(c.deleted), probes=(getattr(c, "probes", None) or ()) if phase == 1 else ())
             except BaseException:
                 if os.environ.get("BR_CHILD_DEBUG"):
                     import traceback
@@ -771,7 +776,7 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
         if getattr(c, "include_all_after_import", None) is not None:
             queue.append((c, set(), 1))
             continue
-        if not c.cheap and not c.import_check:
+        if not c.cheap and not c.import_check and not getattr(c, "probes", None):
             nxt = _next_phase(c, ms, ids)
             if nxt:
                 queue.append((c, nxt, 2))
@@ -870,6 +875,14 @@ def _ingest(c, buf, tests, meta):
             continue
         if parts[0] == "-3":
             continue
+        if parts[0] == "probe":
+            try:
+                num, verdict = parts[1].split()
+                c.probe_res = getattr(c, "probe_res", {})
+                c.probe_res[int(num)] = verdict != "ok"
+            except ValueError:
+                pass
+            continue
         try:
             n = int(parts[0])
         except ValueError:
@@ -919,7 +932,29 @@ def _next_phase(c, ms, ids):
     c.regime = regime
     base |= c.failed & c.cheap
     fx = set(c.exp) & getattr(c, "fixture_readers", set())
-    blind, verify = policy.decide(set(c.exp) - fx, base, regime, n_cheap, ms, ids, getattr(c, "run_ms", None), c.dedicated)
+    probed_bad = set()
+    probed = set()
+    if regime != "cat":
+        # a stand-in run of the same checks decides these (passed: leave out, failed: include)
+        for x, bad in getattr(c, "probe_res", {}).items():
+            if x in c.exp and x not in fx:
+                probed.add(x)
+                if bad:
+                    probed_bad.add(x)
+    pmap = None
+    if regime == "narrow":
+        # what the expensive test's own class did is the best evidence (see policy.NARROW_CELL)
+        pmap = {}
+        frac = nf / max(1, n_cheap)
+        for x in set(c.exp) - fx - probed:
+            cls = ids[x].rsplit("::", 1)[0] + "::"
+            same = [i for i in c.cheap if ids[i].startswith(cls)]
+            p = policy.narrow_prob(ids[x], bool(same), any(i in c.failed for i in same), frac)
+            if n_cheap < policy.WEAK_EVIDENCE or x in c.dedicated:
+                p = max(p, 0.3)
+            pmap[x] = p
+    blind, verify = policy.decide(set(c.exp) - fx - probed, base | probed_bad, regime, n_cheap, ms, ids, getattr(c, "run_ms", None), c.dedicated, pmap)
+    blind |= probed_bad
     if fx:
         # what cheap tests did says nothing about a test reading an edited data file
         b2, v2 = policy.decide(fx, base | blind, "unknown", n_cheap, ms, ids, getattr(c, "run_ms", None), c.dedicated)

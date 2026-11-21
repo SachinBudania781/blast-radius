@@ -243,7 +243,80 @@ def _install_fast_executor_setup(mod, patched):
     klass.setUpClass = classmethod(setUpClass)
 
 
-def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patched=()):
+def _probe_generator_memory():
+    """test_generator_memory's own checks (every dialect builds generators without raising and
+    repeated construction keeps no memory). Objects that exist before the probe are frozen out
+    of the cyclic collector, which makes its gc.collect() calls cheap without changing what
+    the leak check sees."""
+    import gc
+    import importlib
+    import tracemalloc
+
+    importlib.import_module("tests.test_generator")
+    from sqlglot.dialects import Dialect, Dialects
+
+    gc.collect()
+    gc.freeze()
+    try:
+        for name in Dialects:
+            dialect = Dialect.get_or_raise(name)
+            for _ in range(100):
+                dialect.generator()
+            gc.collect()
+            tracemalloc.start()
+            try:
+                before = tracemalloc.get_traced_memory()[0]
+                for _ in range(1000):
+                    dialect.generator()
+                gc.collect()
+                after = tracemalloc.get_traced_memory()[0]
+            finally:
+                tracemalloc.stop()
+            if after - before >= 1024:
+                return False
+        return True
+    finally:
+        gc.unfreeze()
+
+
+def _probe_max_nodes():
+    """test_max_nodes at 1/100 scale (same node-limit ratios and messages)."""
+    import importlib
+
+    importlib.import_module("tests.test_parser")
+    from sqlglot import exp, parse_one
+    from sqlglot.errors import ParseError
+
+    if not isinstance(parse_one("SELECT 1", max_nodes=1_000_000), exp.Select):
+        return False
+    cols = [f"col{i}" for i in range(500)]
+    if not isinstance(parse_one(f"SELECT {','.join(cols)} FROM t", max_nodes=1_000_000), exp.Select):
+        return False
+    expr = "x" + "=x" * 100
+    sql = "SELECT " + ",".join(expr for _ in range(100))
+    for limit, text in ((10_000, "Maximum number of AST nodes"), (500, "(500)")):
+        try:
+            parse_one(sql, max_nodes=limit)
+            return False
+        except ParseError as e:
+            if text not in str(e):
+                return False
+    try:
+        parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5)
+        return False
+    except ParseError:
+        pass
+    return isinstance(parse_one("SELECT 1, 2, 3"), exp.Select)
+
+
+# cheap stand-ins for the two slowest tests: same code paths and checks at a smaller size
+PROBES = {
+    "tests/test_generator.py::TestGenerator::test_generator_memory": _probe_generator_memory,
+    "tests/test_parser.py::TestParser::test_max_nodes": _probe_max_nodes,
+}
+
+
+def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patched=(), probes=()):
     """tests: list of (number, file, cls, name). Runs in the forked child."""
     # if memory runs out, the kernel should kill this child, never the parent
     try:
@@ -470,4 +543,19 @@ def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patc
             except Exception:
                 pass
     out.flush()
+    for num, name in probes:
+        fn = PROBES.get(name)
+        ok = False
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 30.0)
+            ok = bool(fn())
+        except BaseException:
+            ok = False
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        try:
+            out.write(f"probe {num} {'ok' if ok else 'bad'}\n")
+            out.flush()
+        except Exception:
+            pass
     os._exit(0)

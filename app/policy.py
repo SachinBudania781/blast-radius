@@ -66,6 +66,35 @@ def prob(test_id, regime, n_cheap, dedicated=False):
     return 0.5  # unknown: nothing cheap to learn from
 
 
+# narrow regime, refined by what the cheap tests of the expensive test's own class did and by
+# the share of all cheap candidates that failed (validator + campaign mutants, smoothed):
+#   same class all passed, <2% failing: 2/94 failed; 2-10%: 3/25; >=10%: 2/14
+#   same class had a failure, <2%: 3/31; 2-10%: 36/90; >=10%: 27/38; no same-class cheap test: 0/7
+NARROW_CELL = {"P<2": 0.03, "P<10": 0.12, "P>10": 0.2, "F<2": 0.12, "N": 0.08}
+NARROW_F = {  # same class had a failure and >= 2% of cheap candidates failed
+    "test_annotate_funcs": 0.65, "test_qualify_columns": 0.85, "test_merge_subqueries": 0.5,
+    "test_canonicalize": 0.45, "test_tpcds": 0.65, "test_scope": 0.35, "test_execute_tpcds": 0.5,
+    "test_optimized_tpch": 0.3, "test_optimize_in_nulls": 0.2, "test_agg_order": 0.15,
+    "test_execute_tpch": 0.15, "test_cache_does_not_retain_queries": 0.1,
+}
+
+
+def narrow_prob(test_id, same_cls, cls_failed, frac):
+    name = test_id.rsplit("::", 1)[-1]
+    if not same_cls:
+        return NARROW_CELL["N"]
+    if not cls_failed:
+        if frac < 0.02:
+            p = NARROW_CELL["P<2"]
+            if name in ("test_qualify_columns", "test_tpcds"):
+                p = 0.1
+            return p
+        return NARROW_CELL["P<10"] if frac < 0.1 else NARROW_CELL["P>10"]
+    if frac < 0.02:
+        return NARROW_CELL["F<2"] if name != "test_scope" else 0.3
+    return max(NARROW_F.get(name, 0.4), 0.7 if frac >= 0.1 else 0.0) if frac >= 0.1 else NARROW_F.get(name, 0.4)
+
+
 def pack_cost(tests, ms):
     """Cost in ms of the best packing (LPT per worker count)."""
     if not tests:
@@ -83,16 +112,17 @@ def pack_cost(tests, ms):
     return best
 
 
-def decide(exp_tests, base, regime, n_cheap, ms, ids, run_ms=None, dedicated=frozenset()):
+def decide(exp_tests, base, regime, n_cheap, ms, ids, run_ms=None, dedicated=frozenset(), pmap=None):
     """For each expensive test choose 'blind', 'verify' or 'skip' by expected cost.
 
-    base: tests already in the output. Returns (blind, verify) sets.
+    base: tests already in the output. pmap: probabilities that override prob().
+    Returns (blind, verify) sets.
     """
     blind, verify = set(), set()
     cur = set(base)
     cur_cost = pack_cost(cur, ms)
     for x in sorted(exp_tests, key=lambda t: -ms[t]):
-        p = prob(ids[x], regime, n_cheap, x in dedicated)
+        p = pmap[x] if pmap and x in pmap else prob(ids[x], regime, n_cheap, x in dedicated)
         m = pack_cost(cur | {x}, ms) - cur_cost
         c_blind = m
         c_verify = CPU_RATIO * (run_ms or {}).get(x, ms[x]) + p * m
