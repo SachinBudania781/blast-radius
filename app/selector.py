@@ -649,7 +649,11 @@ def main():
         c.cheap, c.exp = cheap, exp_
         c.run_ms = run_ms
         # cheap stand-ins for the slowest tests, run after the cheap ones
-        c.probes = [] if VERIFY_ALL else [(x, tests[x]["id"]) for x in sorted(exp_) if tests[x]["id"] in PROBE_IDS]
+        # (not when the test's own file is edited: the stand-in would not see the edit)
+        c.probes = [] if VERIFY_ALL else [
+            (x, tests[x]["id"]) for x in sorted(exp_)
+            if tests[x]["id"] in PROBE_IDS and tests[x]["file"] not in c.patched and tests[x]["file"] not in c.deleted
+        ]
         if not VERIFY_ALL and cheap and policy.CPU_RATIO * sum(run_ms.get(t, ms[t]) for t in cheap) > policy.pack_cost(cheap | exp_ | c.sure | c.always, ms):
             # running them would cost more than just including them
             if not c.import_check:
@@ -756,7 +760,9 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
                 timeouts = {t: min(float(os.environ.get("BR_TIMEOUT_CAP", "45")), max(5.0, ms[t] / 1000 * tm + 3)) for t in tests}
                 runner.TPC_FILTER = getattr(c, "tpc_filter", None)
                 runner.OPT_FILTER = getattr(c, "opt_filter", None)
-                runner.child_main(ov, tl, w, timeouts, 0, sorted(m for m in c.import_check if m.startswith("sqlglot/") or m.startswith("tests/")), set(c.patched) | set(c.deleted), probes=(getattr(c, "probes", None) or ()) if phase == 1 else ())
+                imods = sorted(m for m in c.import_check if m.startswith("sqlglot/") or m.startswith("tests/"))
+                extra = None  # (runner.importers_closure narrows this; measured no gain, so all dialects)
+                runner.child_main(ov, tl, w, timeouts, 0, imods, set(c.patched) | set(c.deleted), probes=(getattr(c, "probes", None) or ()) if phase == 1 else (), import_extra=extra)
             except BaseException:
                 if os.environ.get("BR_CHILD_DEBUG"):
                     import traceback

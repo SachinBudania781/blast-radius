@@ -132,9 +132,21 @@ def _parse_rows(file_name):
 
 
 def precompute_executor_rows(src):
-    """Parse the TPC-H/TPC-DS CSVs once in the parent, exactly like TestExecutor.setUpClass."""
+    """Parse the TPC-H/TPC-DS CSVs once in the parent, exactly like TestExecutor.setUpClass.
+    The image build stores the result for the pristine fixtures (BR_ROWS_CACHE)."""
     global PRE_ROWS
     import importlib.util
+
+    cache = os.environ.get("BR_ROWS_CACHE")
+    if cache and os.path.exists(cache):
+        try:
+            import marshal
+
+            with open(cache, "rb") as f:
+                PRE_ROWS = marshal.load(f)
+            return
+        except Exception:
+            PRE_ROWS = None
 
     spec = importlib.util.spec_from_file_location("_br_helpers", os.path.join(src, "tests", "helpers.py"))
     h = importlib.util.module_from_spec(spec)
@@ -316,7 +328,95 @@ PROBES = {
 }
 
 
-def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patched=(), probes=()):
+LEAF_DIRS = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")
+
+
+def _leaf_module(rel):
+    if not rel.startswith(LEAF_DIRS) or rel.count("/") != 2:
+        return False
+    return rel.rsplit("/", 1)[1] not in ("__init__.py", "dialect.py", "base.py")
+
+
+_TOP_IMPORT = None
+_GRAPH = {}
+
+
+def _top_imports(rel, text):
+    """Modules a file imports at module level (lines starting at column 0)."""
+    import re
+
+    global _TOP_IMPORT
+    if _TOP_IMPORT is None:
+        _TOP_IMPORT = re.compile(r"^(?:from[ \t]+([\w.]+)[ \t]+import[ \t]+(\([^)]*\)|[^\n]*)|import[ \t]+([^\n]+))", re.M)
+    pkg = rel[:-3].replace("/", ".").rsplit(".", 1)[0]
+    if rel.endswith("/__init__.py"):
+        pkg = rel[: -len("/__init__.py")].replace("/", ".")
+    out = set()
+    for m in _TOP_IMPORT.finditer(text):
+        base, names, plain = m.group(1), m.group(2), m.group(3)
+        if plain is not None:
+            for part in plain.split(","):
+                out.add(part.strip().split(" ")[0])
+            continue
+        if base.startswith("."):
+            dots = len(base) - len(base.lstrip("."))
+            root = pkg.split(".")
+            root = root[: len(root) - (dots - 1)] if dots > 1 else root
+            base = ".".join(root + ([base.lstrip(".")] if base.strip(".") else []))
+        out.add(base)
+        for n in names.strip("()").replace("\n", " ").split(","):
+            n = n.strip().split(" ")[0]
+            if n and n.isidentifier():
+                out.add(f"{base}.{n}")
+    return out
+
+
+def import_graph(root, patched=None):
+    """{module relpath: set of module names it imports at top level} for sqlglot/ (cached per root)."""
+    g = _GRAPH.get(root)
+    if g is None:
+        g = {}
+        for d, _, names in os.walk(os.path.join(root, "sqlglot")):
+            for n in names:
+                if n.endswith(".py"):
+                    full = os.path.join(d, n)
+                    rel = os.path.relpath(full, root).replace(os.sep, "/")
+                    try:
+                        with open(full, encoding="utf-8") as f:
+                            g[rel] = _top_imports(rel, f.read())
+                    except (OSError, UnicodeDecodeError):
+                        g[rel] = set()
+        _GRAPH[root] = g
+    if patched:
+        g = dict(g)
+        for rel, data in patched.items():
+            if rel.startswith("sqlglot/") and rel.endswith(".py"):
+                try:
+                    g[rel] = _top_imports(rel, data.decode("utf-8"))
+                except UnicodeDecodeError:
+                    g[rel] = set()
+    return g
+
+
+def importers_closure(root, rels, patched=None):
+    """Modules under sqlglot/ that import any of rels at module level, directly or through
+    each other (so a failure while importing rels would show up when importing them)."""
+    g = import_graph(root, patched)
+    mod_of = {rel: rel[:-3].replace("/", ".") for rel in g}
+    found, todo = set(), list(rels)
+    while todo:
+        rel = todo.pop()
+        dotted = rel[:-3].replace("/", ".")
+        for other, imps in g.items():
+            if other in found or other in rels:
+                continue
+            if dotted in imps:
+                found.add(other)
+                todo.append(other)
+    return sorted(found)
+
+
+def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patched=(), probes=(), import_extra=None):
     """tests: list of (number, file, cls, name). Runs in the forked child."""
     # if memory runs out, the kernel should kill this child, never the parent
     try:
@@ -390,8 +490,23 @@ def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patc
 
     # class bodies elsewhere run sqlglot code at import time (e.g. generators parse SQL
     # templates), so a definition change can break importing *another* module: import every
-    # dialect module too and report the ones that fail
-    if import_mods:
+    # dialect module too and report the ones that fail. A per-dialect module (dialects/x.py,
+    # parsers/x.py, ...) only runs when imported, so only modules importing it need checking.
+    if import_mods and import_extra is not None:
+        broken = False
+        for rel in import_extra:
+            try:
+                signal.setitimer(signal.ITIMER_REAL, float(os.environ.get("BR_IMPORT_TIMEOUT", "60")))
+                __import__(rel[:-3].replace("/", "."))
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            except BaseException:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                out.write(f"-2 {rel}\n")
+                broken = True
+        if broken:
+            out.flush()
+            os._exit(0)
+    elif import_mods:
         try:
             names = list(sys.modules["sqlglot.dialects"].DIALECT_MODULE_NAMES) if "sqlglot.dialects" in sys.modules else []
         except Exception:
