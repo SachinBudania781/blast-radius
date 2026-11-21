@@ -405,7 +405,10 @@ def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patc
         def addUnexpectedSuccess(self, test):
             self._mark(test)
 
-    for file, items in by_file.items():
+    # like pytest: import every test module before running any test (tests may patch
+    # sys.modules / environment while they run, which must not affect later imports)
+    imported = {}
+    for file in by_file:
         modname = file[:-3].replace("/", ".")
         try:
             signal.setitimer(signal.ITIMER_REAL, float(os.environ.get("BR_IMPORT_TIMEOUT", "60")))
@@ -415,9 +418,21 @@ def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patc
                 _install_fast_executor_setup(mod, patched)
             if modname == "tests.test_optimizer":
                 _install_opt_filter(mod)
+            imported[file] = mod
         except BaseException:
             signal.setitimer(signal.ITIMER_REAL, 0)
+            tf = os.environ.get("BR_TRACE")
+            if tf:
+                import traceback
+
+                with open(tf, "a") as fh:
+                    fh.write(f"=== IMPORT {file}\n" + traceback.format_exc()[-2500:] + "\n")
             out.write(f"{FAIL_ALL_IN_FILE} {file}\n")
+            continue
+
+    for file, items in by_file.items():
+        mod = imported.get(file)
+        if mod is None:
             continue
         by_cls = {}
         for num, cls, name in items:
