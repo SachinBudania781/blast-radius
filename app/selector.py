@@ -658,8 +658,9 @@ def main():
     except Exception:
         cpu_map = {}
     est = [cpu_map.get(t["id"], ms[t["number"]] * policy.CPU_RATIO) for t in tests]
-    global _MAPS
+    global _MAPS, _META
     _MAPS = maps
+    _META = meta
     try:
         os.makedirs(TMP, exist_ok=True)
     except OSError:
@@ -734,6 +735,7 @@ def main():
 
 
 _MAPS = None
+_META = None
 
 
 def _diag(outs, tests, meta, ms, maps, ids):
@@ -810,8 +812,9 @@ def _diag(outs, tests, meta, ms, maps, ids):
 
 
 def run_jobs(jobs, meta, ms, maps, ids=None):
-    global _MAPS
+    global _MAPS, _META
     _MAPS = maps
+    _META = meta
     try:
         os.makedirs(TMP, exist_ok=True)
     except OSError:
@@ -893,6 +896,9 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
                 else:
                     tl = [meta[t] for t in sorted(tests, key=lambda t: (_z.crc32(f"{meta[t][1]}::{meta[t][2]}".encode()), meta[t][1], meta[t][2]))]
                 gate = (getattr(c, "early_gate", None) or set()) if phase == 1 else set()
+                if phase == 1 and ids is not None and _num(ids, EXEC_TPCDS) in c.exp:
+                    # the cheap TPC tests first: their result decides the TPC-DS run
+                    gate = set(gate) | {g for g in (_num(ids, EXEC_TPCH), _num(ids, OPT_TPCH)) if g in tests}
                 if gate:
                     first = [meta[g] for g in sorted(gate) if g in tests]
                     tl = first + [m for m in tl if m[0] not in gate]  # their files and classes run first
@@ -1049,6 +1055,8 @@ def _ingest(c, buf, tests, meta):
     for t in tests:
         if t not in c.reported:
             c.failed.add(t)
+    # test files that imported fine with the patch (they reported results)
+    c.ok_files = getattr(c, "ok_files", set()) | ({meta[t][1] for t in c.reported if 0 <= t < len(meta)} - set(c.file_fail))
     if c.file_fail:
         # "a test fails when its file cannot be imported": every test of that file fails
         for t in range(len(meta)):
@@ -1146,7 +1154,13 @@ def _next_phase(c, ms, ids):
             if q is not None and x not in fx:
                 proxy_p[x] = q
     c.proxy_probs = {}
-    if regime != "cat" and not VERIFY_ALL and not any(p.startswith(EXEC_SIDE) for p in touched):
+    eh_, oh_ = _num(ids, EXEC_TPCH), _num(ids, OPT_TPCH)
+    tpc_ok = any(g is not None and g in c.cheap and g in c.reported and g not in c.failed for g in (eh_, oh_))
+    tpc_bad = any(g is not None and g in c.cheap and g in c.reported and g in c.failed for g in (eh_, oh_))
+    # catastrophic elsewhere (e.g. dialect test files not importing) while the cheap TPC tests
+    # ran and passed: the executor TPC tests are judged on that evidence, not on the regime
+    use_tpc = regime != "cat" or (tpc_ok and not tpc_bad)
+    if use_tpc and not VERIFY_ALL and not any(p.startswith(EXEC_SIDE) for p in touched):
         eh = _num(ids, EXEC_TPCH)
         for ex_id, (px_id, p_ok, p_bad) in TPC_PROXY.items():
             ex, px = _num(ids, ex_id), _num(ids, px_id)
@@ -1246,9 +1260,10 @@ def _finish(c, ms):
             res |= _MAPS.set(mu)
     if c.file_fail:
         # a test file failed to import because of patched code: every test file importing
-        # a patched module fails the same way
+        # a patched module fails the same way (except files that did import and run here)
+        ok = getattr(c, "ok_files", set()) - set(c.file_fail)
         for rel, mu in c.mod_sets.items():
-            res |= _MAPS.set(mu)
+            res |= {t for t in _MAPS.set(mu) if _META is None or _META[t][1] not in ok}
     c.result = res
 
 
