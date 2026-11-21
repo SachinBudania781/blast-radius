@@ -182,6 +182,9 @@ def precompute_executor_rows(src, subs=("tpc-h", "tpc-ds")):
         PRE_ROWS[("_done", sub)] = True
 
 
+GC_OFF_TESTS = frozenset() if os.environ.get("BR_GC_TPC", "1") != "1" else frozenset(
+    {"test_execute_tpcds", "test_execute_tpch", "test_optimized_tpch"}
+)
 TPC_FILTER = None  # {"tpc-h": set(indices), "tpc-ds": set(indices)} of edited fixture queries
 OPT_FILTER = None  # {test method name: set((fixture filename, index))} queries a change can affect
 CURRENT_TEST = [None]
@@ -586,10 +589,20 @@ def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patc
             num = getattr(test, "_br_num", None)
             self.cur = num
             t = timeouts.get(num, 10.0)
+            # the TPC executor tests build millions of short-lived row tuples: the cyclic
+            # collector's full passes cost ~20% of their CPU; switch it off while they run
+            if CURRENT_TEST[0] in GC_OFF_TESTS:
+                import gc
+
+                gc.disable()
             signal.setitimer(signal.ITIMER_REAL, t)
 
         def stopTest(self, test):
             signal.setitimer(signal.ITIMER_REAL, 0)
+            if CURRENT_TEST[0] in GC_OFF_TESTS:
+                import gc
+
+                gc.enable()
             super().stopTest(test)
             num = getattr(test, "_br_num", None)
             if num is not None:
@@ -697,6 +710,10 @@ def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patc
             except BaseException:
                 pass
             signal.setitimer(signal.ITIMER_REAL, 0)
+            if GC_OFF_TESTS:
+                import gc
+
+                gc.enable()
             if result.fixture_error:
                 for num, _ in members:
                     report(num, True)
