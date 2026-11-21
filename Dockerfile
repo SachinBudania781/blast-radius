@@ -25,6 +25,7 @@ ENV BR_SRC=/app/sqlglot \
     PYTHONDONTWRITEBYTECODE=1 \
     OPENBLAS_NUM_THREADS=1 \
     OMP_NUM_THREADS=1 \
-    MKL_NUM_THREADS=1
+    MKL_NUM_THREADS=1 \
+    BR_PDIAG=1
 
 CMD ["python", "/app/app/selector.py"]
