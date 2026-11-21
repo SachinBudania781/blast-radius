@@ -1202,7 +1202,7 @@ def _next_phase(c, ms, ids):
             px_alone = min(m_px, v_px + q * m_px, policy.MISS_MS * q)
             p_ok, p_bad = c.proxy_probs.get(ex) or TPC_PROXY[ids[ex]][1:]
             cost_b = (v_px + q * m_px - px_alone) + q * min(m_ex, policy.MISS_MS * p_bad) + (1 - q) * min(m_ex, policy.MISS_MS * p_ok)
-            if cost_b >= cost_a:
+            if cost_b >= 0.85 * cost_a - 1000:  # only clear wins (the proxy can run slower on broken code)
                 del deferred[ex]
     blind, verify = policy.decide(set(c.exp) - fx - probed - set(deferred), base | probed_bad, regime, n_cheap, ms, ids, getattr(c, "run_ms", None), c.dedicated, pmap, cpu=getattr(c, "cpu_cost", None))
     blind |= probed_bad
