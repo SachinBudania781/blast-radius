@@ -650,7 +650,10 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
             try:
                 os.close(r)
                 runner.build_overlay(SRC, ov, c.patched, c.deleted)
-                tl = [meta[t] for t in sorted(tests, key=lambda t: (meta[t][1], meta[t][2]))]
+                import zlib as _z
+
+                # deterministic shuffle of test classes: early results then represent the whole set
+                tl = [meta[t] for t in sorted(tests, key=lambda t: (_z.crc32(f"{meta[t][1]}::{meta[t][2]}".encode()), meta[t][1], meta[t][2]))]
                 tm = float(os.environ.get("BR_TIMEOUT_MULT", "5"))
                 timeouts = {t: min(float(os.environ.get("BR_TIMEOUT_CAP", "45")), max(5.0, ms[t] / 1000 * tm + 3)) for t in tests}
                 runner.TPC_FILTER = getattr(c, "tpc_filter", None)
@@ -710,6 +713,18 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
                 if chunk:
                     buf += chunk
                     running[fd][2] = buf
+                    if c.phase == 1 and len(c.cheap) >= 40 and not getattr(c, "early_cat", False):
+                        n_ok = buf.count(b" 0\n")
+                        n_bad = buf.count(b" 1\n")
+                        n = n_ok + n_bad
+                        if n >= max(20, len(c.cheap) // 10) and n_bad >= 0.85 * n:
+                            # the change breaks almost everything: include all candidates
+                            c.early_cat = True
+                            try:
+                                os.kill(pid, 9)
+                            except OSError:
+                                pass
+                            done = True
                     if c.phase == 1 and getattr(c, "early_blind", None) and (b" 1\n" in buf.replace(b"-3 ready\n", b"") or b"-1 " in buf or b"-2 " in buf):
                         # live change and a big test goes on its own worker anyway: stop here
                         c.early_stopped = True
@@ -795,7 +810,9 @@ def _next_phase(c, ms, ids):
         c.blind |= blind
         return verify or None
     nf = len(c.failed & c.cheap)
-    if not c.cheap:
+    if getattr(c, "early_cat", False):
+        regime = "cat"
+    elif not c.cheap:
         regime = "unknown"
     elif nf == 0:
         regime = "dead"
