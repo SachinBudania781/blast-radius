@@ -39,7 +39,8 @@ PDIAG = os.environ.get("BR_PDIAG") == "1"  # measurement build: why was a passin
 CDIAG = os.environ.get("BR_CDIAG") == "1"  # measurement build: where the CPU goes
 CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "1.25"))  # scoring machine CPU / ours (measured tests)
 GEST = None
-GUARD_THETA = float(os.environ.get("BR_GUARD_THETA", "0.8"))  # running cheap tests still leaves their failures to include
+SLACK_KAPPA = float(os.environ.get("BR_SLACK", "0.5"))  # stop running cheap tests that fit next to the big unverified ones
+GUARD_THETA = float(os.environ.get("BR_GUARD_THETA", "1.0"))  # (0.8 cost +3.8 s on practice)
 CPU_BY_PHASE = {}  # measurement build: encode where unverified tests were wasted  # measurement mode (never include unverified, except catastrophic)
 
 # tests with a cheap stand-in in runner.PROBES
@@ -1095,6 +1096,16 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
                             except OSError:
                                 pass
                             done = True
+                    if not done and c.phase == 1 and SLACK_KAPPA > 0 and not getattr(c, "early_cat", False):
+                        n_now = buf.count(b"\n")
+                        if n_now >= getattr(c, "slack_next", 30):
+                            c.slack_next = n_now + max(25, len(c.cheap) // 20)
+                            if _slack_stop(c, buf, ms, ids):
+                                try:
+                                    os.kill(pid, 9)
+                                except OSError:
+                                    pass
+                                done = True
                     gate = getattr(c, "early_gate", None)
                     if gate:
                         hit = any((b"\n" + buf).find(f"\n{g} 1\n".encode()) >= 0 for g in gate) or b"-1 " in buf or b"-2 " in buf
@@ -1134,6 +1145,51 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
                     queue.insert(0, (c, nxt, 2))
                 else:
                     _finish(c, ms)
+
+
+def _slack_stop(c, buf, ms, ids):
+    """Phase 1, while the cheap tests run: once the big tests that will go in unverified leave
+    room next to them (a worker as long as the biggest of them), including the cheap tests
+    still to run costs less than running them. True: stop the child now."""
+    if SLACK_KAPPA <= 0 or not c.exp or getattr(c, "early_blind", None) or getattr(c, "probes", None):
+        return False
+    rep, bad = set(), set()
+    for line in buf.decode("utf-8", "replace").splitlines():
+        a = line.split(" ")
+        if len(a) == 2 and a[0].isdigit():
+            rep.add(int(a[0]))
+            if a[1] == "1":
+                bad.add(int(a[0]))
+    if b"-1 " in buf or b"-2 " in buf:
+        return False
+    rep &= c.cheap
+    rest = c.cheap - rep
+    if len(bad) < 2 or len(rep) < 30 or len(rest) < 10:
+        return False
+    import copy
+
+    d = copy.copy(c)
+    d.cheap, d.failed, d.reported = set(rep), set(bad) | (c.failed & c.cheap - rest), set(c.reported) | rep
+    d.phase, d.early_stopped, d.early_cat, d.slack_R = 1, False, False, None
+    d.deferred = None
+    try:
+        verify = _next_phase(d, ms, ids) or set()
+    except Exception:  # noqa: BLE001
+        return False
+    blind = set(getattr(d, "blind", set()) or set())
+    if not blind or getattr(d, "regime", None) == "dead":
+        return False
+    base = set(d.failed) | blind | c.always | c.sure | set(getattr(d, "deferred", None) or ())
+    extra = policy.pack_cost(base | rest, ms) - policy.pack_cost(base, ms)
+    gest = GEST or [policy.CPU_RATIO * x for x in ms]
+    rm = getattr(c, "run_ms", None) or {}
+    run = sum(gest[t] * (rm[t] / ms[t] if t in rm and ms[t] else 1.0) if ms[t] >= EXPENSIVE * 1000 else policy.CPU_RATIO * rm.get(t, ms[t]) for t in rest)
+    if extra <= SLACK_KAPPA * run:
+        c.slack_R = rest
+        if DEBUG:
+            log(f"slack-stop {c.cid} ran={len(rep)} failed={len(bad)} rest={len(rest)} extra={extra/1000:.2f}s run={run/1000:.2f}s regime={d.regime} blind={len(blind)}")
+        return True
+    return False
 
 
 def _ingest(c, buf, tests, meta):
@@ -1242,6 +1298,12 @@ def _next_phase(c, ms, ids):
         blind, verify = policy.decide(rest, base | c.blind, "cat", n_cheap, ms, ids, getattr(c, "run_ms", None), c.dedicated, cpu=getattr(c, "cpu_cost", None))
         c.blind |= blind
         return verify or None
+    slack_r = getattr(c, "slack_R", None) or set()
+    if slack_r:
+        # stopped early (see _slack_stop): judge on the tests that ran, include the rest unrun
+        c.failed -= slack_r
+        c.cheap = c.cheap - slack_r
+        n_cheap = len(c.cheap)
     nf = len(c.failed & c.cheap)
     if getattr(c, "early_cat", False):
         regime = "cat"
@@ -1370,6 +1432,8 @@ def _next_phase(c, ms, ids):
         blind = set()
     c.blind = blind
     c.why = {x: ("proxy" if x in (pmap or {}) and x in proxy_p else regime) for x in blind}
+    if slack_r:
+        c.blind = blind | slack_r
     if DEBUG:
         nm = lambda xs: sorted(ids[x].rsplit("::", 1)[-1] for x in xs)  # noqa: E731
         log(f"decide {c.cid} {regime} n={n_cheap} nf={nf} blind={nm(blind)} verify={nm(verify)} deferred={nm(deferred)} exp={nm(c.exp)} p={ {ids[k].rsplit('::', 1)[-1]: round(v, 3) for k, v in (pmap or {}).items()} } tpc={(eh_ in c.cheap, eh_ in c.failed, oh_ in c.cheap, oh_ in c.failed)}")
