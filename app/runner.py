@@ -617,6 +617,11 @@ def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patc
             out.write(f"{FAIL_ALL_IN_FILE} {file}\n")
             continue
 
+    if os.environ.get("BR_DEBUG") == "1":
+        try:
+            out.write(f"-4 {time.process_time():.3f}\n")
+        except Exception:
+            pass
     if os.environ.get("BR_GC_FREEZE", "1") == "1":
         # everything imported so far lives for the whole child: keep it out of the cyclic
         # collector so collections during the tests only scan what the tests create

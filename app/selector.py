@@ -1002,6 +1002,10 @@ def _ingest(c, buf, tests, meta):
             continue
         if parts[0] == "-3":
             continue
+        if parts[0] == "-4":
+            if DEBUG:
+                log(f"importcpu {c.cid} {parts[1]}")
+            continue
         if parts[0] == "probe":
             try:
                 num, verdict = parts[1].split()
@@ -1039,6 +1043,8 @@ TPC_PROXY = {
 }
 EXEC_SIDE = ("sqlglot/executor/", "sqlglot/planner.py", "sqlglot/generators/python.py", "sqlglot/generator.py",
              "tests/test_executor.py", "tests/test_optimizer.py", "tests/helpers.py", "tests/fixtures/optimizer/tpc-")
+EXEC_TPCH = "tests/test_executor.py::TestExecutor::test_execute_tpch"
+EXEC_TPCDS = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 _ID2NUM = {}
 
 
@@ -1052,7 +1058,7 @@ def _finish_deferred(c, ms, ids):
     """After phase 2: decide the executor tests whose optimizer proxy has now run."""
     cur = set(c.failed) | set(c.always) | set(c.sure) | set(getattr(c, "blind", set()))
     for ex, px in sorted(c.deferred.items()):
-        _, p_ok, p_bad = TPC_PROXY[ids[ex]]
+        p_ok, p_bad = (getattr(c, "proxy_probs", None) or {}).get(ex) or TPC_PROXY[ids[ex]][1:]
         p = p_bad if px in c.failed else p_ok
         m = policy.pack_cost(cur | {ex}, ms) - policy.pack_cost(cur, ms)
         if policy.MISS_MS * p > m:
@@ -1108,15 +1114,26 @@ def _next_phase(c, ms, ids):
     deferred = {}
     proxy_p = {}
     touched = set(c.patched) | set(c.deleted)
+    c.proxy_probs = {}
     if regime != "cat" and not VERIFY_ALL and not any(p.startswith(EXEC_SIDE) for p in touched):
+        eh = _num(ids, EXEC_TPCH)
         for ex_id, (px_id, p_ok, p_bad) in TPC_PROXY.items():
             ex, px = _num(ids, ex_id), _num(ids, px_id)
             if ex is None or px is None or ex not in c.exp or ex in fx or ex in probed:
                 continue
+            if ex_id == EXEC_TPCDS and eh is not None and eh in c.cheap and eh not in fx:
+                # test_execute_tpch (cheap, same executor) ran first: failed -> 44/44 tpcds failed;
+                # passed -> 7/104, and then test_tpcds passed 2/96 / failed 5/8
+                if eh in c.failed:
+                    proxy_p[ex] = 0.97
+                    continue
+                p_ok, p_bad = 0.02, 0.6
+                proxy_p[ex] = 0.07
             if px in c.cheap:
                 proxy_p[ex] = p_bad if px in c.failed else p_ok
             elif px in c.exp and px not in fx:
                 deferred[ex] = px  # maybe: run the proxy in phase 2, decide ex after it
+                c.proxy_probs[ex] = (p_ok, p_bad)
     if regime == "narrow":
         # what the expensive test's own class did is the best evidence (see policy.NARROW_CELL)
         pmap = {}
@@ -1147,7 +1164,7 @@ def _next_phase(c, ms, ids):
             v_ex, v_px = policy.verify_cpu(ex, ms, rm, cpu), policy.verify_cpu(px, ms, rm, cpu)
             cost_a = min(m_ex, v_ex + pe * m_ex, policy.MISS_MS * pe)
             px_alone = min(m_px, v_px + q * m_px, policy.MISS_MS * q)
-            _, p_ok, p_bad = TPC_PROXY[ids[ex]]
+            p_ok, p_bad = c.proxy_probs.get(ex) or TPC_PROXY[ids[ex]][1:]
             cost_b = (v_px + q * m_px - px_alone) + q * min(m_ex, policy.MISS_MS * p_bad) + (1 - q) * min(m_ex, policy.MISS_MS * p_ok)
             if cost_b >= cost_a:
                 del deferred[ex]
