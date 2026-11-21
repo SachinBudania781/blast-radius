@@ -15,7 +15,7 @@ COPY app /app/app
 COPY maps /app/maps
 
 # DuckDB's answers to the TPC fixture queries at the pinned commit, keyed by exact SQL text
-RUN python /app/build/precompute_duck.py /app/sqlglot /app/cache/duck.pkl
+RUN python /app/build/precompute_duck.py /app/sqlglot /app/cache/duck.pkl || echo "duck cache skipped"
 
 # Precompile so the runtime never compiles unchanged modules; make everything readable by nobody.
 RUN python -m compileall -q -j 0 /app/sqlglot/sqlglot /app/sqlglot/tests /app/app \
