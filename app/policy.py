@@ -11,7 +11,8 @@ commit (see tools/campaign.py); unknown tests use DEFAULT.
 
 WORKER_MS = 2000
 MISS_MS = 300000
-CPU_RATIO = 1.3  # our CPU seconds per recorded test second (setup + slower box margin)
+CPU_RATIO = 1.3  # our CPU seconds per recorded test second (tests not in maps/cpu.m; with margin)
+JOB_CPU_MS = 150  # fixed CPU of one test child (fork, overlay, imports)
 
 # P(expensive test fails) by regime, measured by running every candidate on clean synthetic
 # single-line mutants of the pinned commit (tools/campaign.py, tools/validate.py), smoothed.
@@ -43,8 +44,8 @@ NARROW = {
 # test does (seen in the data); unrelated expensive tests essentially never did (0 of ~100).
 DEAD_DEDICATED = 0.3
 # broad real-data tests: their targeted cheap siblings (executor tests) already passed
-DEAD_DEDICATED_BY_TEST = {"test_execute_tpcds": 0.05, "test_execute_tpch": 0.05, "test_optimized_tpch": 0.05}
-DEAD_DEFAULT = 0.008
+DEAD_DEDICATED_BY_TEST = {"test_execute_tpcds": 0.02, "test_execute_tpch": 0.02, "test_optimized_tpch": 0.02}  # 0/29, 0/9, 0/11
+DEAD_DEFAULT = 0.005  # 0/176 non-dedicated expensive tests failed in the dead regime (clean data)
 DEAD = {"test_max_nodes": 0.004, "test_generator_memory": 0.006}
 WEAK_EVIDENCE = 5  # fewer cheap candidates than this: a clean pass says little
 
@@ -112,10 +113,11 @@ def pack_cost(tests, ms):
     return best
 
 
-def decide(exp_tests, base, regime, n_cheap, ms, ids, run_ms=None, dedicated=frozenset(), pmap=None):
+def decide(exp_tests, base, regime, n_cheap, ms, ids, run_ms=None, dedicated=frozenset(), pmap=None, cpu=None):
     """For each expensive test choose 'blind', 'verify' or 'skip' by expected cost.
 
     base: tests already in the output. pmap: probabilities that override prob().
+    cpu: our measured CPU ms to run a test (else CPU_RATIO x recorded/filtered ms).
     Returns (blind, verify) sets.
     """
     blind, verify = set(), set()
@@ -125,7 +127,7 @@ def decide(exp_tests, base, regime, n_cheap, ms, ids, run_ms=None, dedicated=fro
         p = pmap[x] if pmap and x in pmap else prob(ids[x], regime, n_cheap, x in dedicated)
         m = pack_cost(cur | {x}, ms) - cur_cost
         c_blind = m
-        c_verify = CPU_RATIO * (run_ms or {}).get(x, ms[x]) + p * m
+        c_verify = verify_cpu(x, ms, run_ms, cpu) + p * m
         c_skip = MISS_MS * p
         best = min(c_blind, c_verify, c_skip)
         if best == c_blind:
@@ -137,15 +139,21 @@ def decide(exp_tests, base, regime, n_cheap, ms, ids, run_ms=None, dedicated=fro
     return blind, verify
 
 
-def early_stop_ok(cheap, exp_tests, ms, ids, run_ms=None, dedicated=frozenset()):
+def verify_cpu(x, ms, run_ms=None, cpu=None):
+    if cpu and x in cpu:
+        return cpu[x]
+    return CPU_RATIO * (run_ms or {}).get(x, ms[x])
+
+
+def early_stop_ok(cheap, exp_tests, ms, ids, run_ms=None, dedicated=frozenset(), cpu=None):
     """Stop running cheap tests at the first failure when the expensive decisions would be
     the same whether the change turns out broad or narrow, a big test goes on its own
     worker either way, and all cheap candidates fit next to it."""
     if not exp_tests or not cheap:
         return None
-    b_cat, v_cat = decide(exp_tests, set(), "cat", len(cheap), ms, ids, run_ms, dedicated)
-    b_broad, v_broad = decide(exp_tests, set(), "broad", len(cheap), ms, ids, run_ms, dedicated)
-    b_narrow, v_narrow = decide(exp_tests, set(), "narrow", len(cheap), ms, ids, run_ms, dedicated)
+    b_cat, v_cat = decide(exp_tests, set(), "cat", len(cheap), ms, ids, run_ms, dedicated, cpu=cpu)
+    b_broad, v_broad = decide(exp_tests, set(), "broad", len(cheap), ms, ids, run_ms, dedicated, cpu=cpu)
+    b_narrow, v_narrow = decide(exp_tests, set(), "narrow", len(cheap), ms, ids, run_ms, dedicated, cpu=cpu)
     if not b_narrow or not (b_cat == b_broad == b_narrow) or not (v_cat == v_broad == v_narrow):
         return None
     full = pack_cost(set(cheap) | b_narrow, ms)

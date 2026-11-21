@@ -581,6 +581,12 @@ def main():
         f, cls, name = t["id"].split("::")
         meta.append((t["number"], t["file"], cls, name))
     maps = Maps(ntests)
+    # our own CPU ms to run each test (measured at the pinned commit for the slower tests)
+    try:
+        cpu_map = marshal.load(open(os.path.join(MAPS, "cpu.m"), "rb"))
+    except Exception:
+        cpu_map = {}
+    est = [cpu_map.get(t["id"], ms[t["number"]] * policy.CPU_RATIO) for t in tests]
     global _MAPS
     _MAPS = maps
     try:
@@ -617,7 +623,9 @@ def main():
         if VERIFY_ALL:
             c.sure = set()  # measurement mode: run everything we would include unverified
         cand = c.cands - c.always - c.sure
-        cheap = {t for t in cand if ms[t] < EXPENSIVE * 1000}
+        # cheap: recorded or our own measured run time under 1 s (some "slow" tests only pay
+        # for a process pool or class setup in the recorded run)
+        cheap = {t for t in cand if ms[t] < EXPENSIVE * 1000 or est[t] < EXPENSIVE * 1000}
         tf = getattr(c, "tpc_filter", None)
         run_ms = {}
         if tf and not getattr(c, "tpc_filter_bad", False) and not any(p.endswith(".py") for p in c.patched) and not c.deleted:
@@ -648,13 +656,18 @@ def main():
         exp_ = cand - cheap
         c.cheap, c.exp = cheap, exp_
         c.run_ms = run_ms
+        c.cpu_cost = {x: est[x] * (run_ms[x] / ms[x] if x in run_ms and ms[x] > 0 else 1.0) for x in exp_}
         # cheap stand-ins for the slowest tests, run after the cheap ones
         # (not when the test's own file is edited: the stand-in would not see the edit)
         c.probes = [] if VERIFY_ALL else [
             (x, tests[x]["id"]) for x in sorted(exp_)
             if tests[x]["id"] in PROBE_IDS and tests[x]["file"] not in c.patched and tests[x]["file"] not in c.deleted
         ]
-        if not VERIFY_ALL and cheap and policy.CPU_RATIO * sum(run_ms.get(t, ms[t]) for t in cheap) > policy.pack_cost(cheap | exp_ | c.sure | c.always, ms):
+        run_cost = sum(
+            est[t] * (run_ms[t] / ms[t] if t in run_ms else 1.0) if ms[t] >= EXPENSIVE * 1000 else policy.CPU_RATIO * run_ms.get(t, ms[t])
+            for t in cheap
+        )
+        if not VERIFY_ALL and cheap and run_cost > policy.pack_cost(cheap | exp_ | c.sure | c.always, ms):
             # running them would cost more than just including them
             if not c.import_check:
                 c.result = cheap | exp_ | c.sure | c.always
@@ -670,7 +683,7 @@ def main():
 
     ids = [t["id"] for t in tests]
     for c in jobs:
-        c.early_blind = None if (VERIFY_ALL or c.probes) else policy.early_stop_ok(c.cheap, c.exp, ms, ids, getattr(c, "run_ms", None), c.dedicated)
+        c.early_blind = None if (VERIFY_ALL or c.probes) else policy.early_stop_ok(c.cheap, c.exp, ms, ids, getattr(c, "run_ms", None), c.dedicated, getattr(c, "cpu_cost", None))
     try:
         run_jobs(jobs, meta, ms, maps, ids)
     except BaseException as e:  # noqa: BLE001
@@ -932,7 +945,43 @@ def _ingest(c, buf, tests, meta):
                 c.failed.add(t)
 
 
+# executor TPC tests and the optimizer test over the same queries: when the change is not in
+# executor-side code, the optimizer test's outcome predicts the executor test's (validator and
+# campaign mutants: test_tpch passed -> execute_tpch failed 0/90, optimized_tpch 2/98;
+# test_tpcds passed -> execute_tpcds failed 1/102; proxy failed -> ~90% failed)
+TPC_PROXY = {
+    "tests/test_executor.py::TestExecutor::test_execute_tpch": ("tests/test_optimizer.py::TestOptimizer::test_tpch", 0.01, 0.9),
+    "tests/test_executor.py::TestExecutor::test_optimized_tpch": ("tests/test_optimizer.py::TestOptimizer::test_tpch", 0.03, 0.9),
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds": ("tests/test_optimizer.py::TestOptimizer::test_tpcds", 0.02, 0.9),
+}
+EXEC_SIDE = ("sqlglot/executor/", "sqlglot/planner.py", "sqlglot/generators/python.py", "sqlglot/generator.py",
+             "tests/test_executor.py", "tests/test_optimizer.py", "tests/helpers.py", "tests/fixtures/optimizer/tpc-")
+_ID2NUM = {}
+
+
+def _num(ids, test_id):
+    if not _ID2NUM:
+        _ID2NUM.update((t, i) for i, t in enumerate(ids))
+    return _ID2NUM.get(test_id)
+
+
+def _finish_deferred(c, ms, ids):
+    """After phase 2: decide the executor tests whose optimizer proxy has now run."""
+    cur = set(c.failed) | set(c.always) | set(c.sure) | set(getattr(c, "blind", set()))
+    for ex, px in sorted(c.deferred.items()):
+        _, p_ok, p_bad = TPC_PROXY[ids[ex]]
+        p = p_bad if px in c.failed else p_ok
+        m = policy.pack_cost(cur | {ex}, ms) - policy.pack_cost(cur, ms)
+        if policy.MISS_MS * p > m:
+            c.blind = set(getattr(c, "blind", set())) | {ex}
+            cur.add(ex)
+    c.deferred = None
+
+
 def _next_phase(c, ms, ids):
+    if c.phase == 2 and getattr(c, "deferred", None):
+        _finish_deferred(c, ms, ids)
+        return None
     if c.phase != 1:
         return None
     c.phase = 2
@@ -944,7 +993,7 @@ def _next_phase(c, ms, ids):
         # everything cheap goes in unverified, next to the big blind test(s)
         c.blind = set(c.cheap) | set(c.early_blind)
         rest = set(c.exp) - c.blind
-        blind, verify = policy.decide(rest, base | c.blind, "cat", n_cheap, ms, ids, getattr(c, "run_ms", None), c.dedicated)
+        blind, verify = policy.decide(rest, base | c.blind, "cat", n_cheap, ms, ids, getattr(c, "run_ms", None), c.dedicated, cpu=getattr(c, "cpu_cost", None))
         c.blind |= blind
         return verify or None
     nf = len(c.failed & c.cheap)
@@ -973,6 +1022,18 @@ def _next_phase(c, ms, ids):
                 if bad:
                     probed_bad.add(x)
     pmap = None
+    deferred = {}
+    proxy_p = {}
+    touched = set(c.patched) | set(c.deleted)
+    if regime != "cat" and not VERIFY_ALL and not any(p.startswith(EXEC_SIDE) for p in touched):
+        for ex_id, (px_id, p_ok, p_bad) in TPC_PROXY.items():
+            ex, px = _num(ids, ex_id), _num(ids, px_id)
+            if ex is None or px is None or ex not in c.exp or ex in fx or ex in probed:
+                continue
+            if px in c.cheap:
+                proxy_p[ex] = p_bad if px in c.failed else p_ok
+            elif px in c.exp and px not in fx:
+                deferred[ex] = px  # maybe: run the proxy in phase 2, decide ex after it
     if regime == "narrow":
         # what the expensive test's own class did is the best evidence (see policy.NARROW_CELL)
         pmap = {}
@@ -984,22 +1045,53 @@ def _next_phase(c, ms, ids):
             if n_cheap < policy.WEAK_EVIDENCE or x in c.dedicated:
                 p = max(p, 0.3)
             pmap[x] = p
-    blind, verify = policy.decide(set(c.exp) - fx - probed, base | probed_bad, regime, n_cheap, ms, ids, getattr(c, "run_ms", None), c.dedicated, pmap)
+    if proxy_p:
+        pmap = dict(pmap or {})
+        pmap.update(proxy_p)
+    if deferred:
+        # defer only when running the proxy is worth its CPU (expected cost, policy.decide terms)
+        cpu = getattr(c, "cpu_cost", None) or {}
+        rm = getattr(c, "run_ms", None)
+        cur = base | probed_bad
+        cur_cost = policy.pack_cost(cur, ms)
+        for ex, px in list(deferred.items()):
+            def p_of(x):
+                return (pmap or {}).get(x) if pmap and x in pmap else policy.prob(ids[x], regime, n_cheap, x in c.dedicated)
+
+            pe, q = p_of(ex), p_of(px)
+            m_ex = policy.pack_cost(cur | {ex}, ms) - cur_cost
+            m_px = policy.pack_cost(cur | {px}, ms) - cur_cost
+            v_ex, v_px = policy.verify_cpu(ex, ms, rm, cpu), policy.verify_cpu(px, ms, rm, cpu)
+            cost_a = min(m_ex, v_ex + pe * m_ex, policy.MISS_MS * pe)
+            px_alone = min(m_px, v_px + q * m_px, policy.MISS_MS * q)
+            _, p_ok, p_bad = TPC_PROXY[ids[ex]]
+            cost_b = (v_px + q * m_px - px_alone) + q * min(m_ex, policy.MISS_MS * p_bad) + (1 - q) * min(m_ex, policy.MISS_MS * p_ok)
+            if cost_b >= cost_a:
+                del deferred[ex]
+    blind, verify = policy.decide(set(c.exp) - fx - probed - set(deferred), base | probed_bad, regime, n_cheap, ms, ids, getattr(c, "run_ms", None), c.dedicated, pmap, cpu=getattr(c, "cpu_cost", None))
     blind |= probed_bad
+    for ex, px in deferred.items():
+        blind.discard(px)
+        verify.add(px)
+    c.deferred = deferred or None
     if fx:
         # what cheap tests did says nothing about a test reading an edited data file
-        b2, v2 = policy.decide(fx, base | blind, "unknown", n_cheap, ms, ids, getattr(c, "run_ms", None), c.dedicated)
+        b2, v2 = policy.decide(fx, base | blind, "unknown", n_cheap, ms, ids, getattr(c, "run_ms", None), c.dedicated, cpu=getattr(c, "cpu_cost", None))
         blind |= b2
         verify |= v2
     if VERIFY_ALL and regime != "cat":
         verify |= blind
         blind = set()
     c.blind = blind
+    if DEBUG:
+        nm = lambda xs: sorted(ids[x].rsplit("::", 1)[-1] for x in xs)  # noqa: E731
+        log(f"decide {c.cid} {regime} n={n_cheap} nf={nf} blind={nm(blind)} verify={nm(verify)} deferred={nm(deferred)} exp={nm(c.exp)}")
     return verify or None
 
 
 def _finish(c, ms):
     res = set(c.failed) | c.always | c.sure | getattr(c, "blind", set())
+    res |= set(getattr(c, "deferred", None) or ())  # proxy never ran (deadline, fork failure): include
     res |= getattr(c, "include_all_after_import", None) or set()
     for m in c.import_failed:
         if m in c.import_fail_sets:
