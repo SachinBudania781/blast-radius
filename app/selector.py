@@ -1067,6 +1067,7 @@ TPC_PROXY = {
 }
 EXEC_SIDE = ("sqlglot/executor/", "sqlglot/planner.py", "sqlglot/generators/python.py", "sqlglot/generator.py",
              "tests/test_executor.py", "tests/test_optimizer.py", "tests/helpers.py", "tests/fixtures/optimizer/tpc-")
+EXEC_ONLY = ("sqlglot/executor/", "sqlglot/planner.py", "sqlglot/generators/python.py")
 EXEC_TPCH = "tests/test_executor.py::TestExecutor::test_execute_tpch"
 EXEC_TPCDS = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 OPT_TPCH = "tests/test_optimizer.py::TestOptimizer::test_tpch"
@@ -1139,6 +1140,11 @@ def _next_phase(c, ms, ids):
     deferred = {}
     proxy_p = {}
     touched = set(c.patched) | set(c.deleted)
+    if regime in ("dead", "unknown") and touched and all(p.startswith(EXEC_ONLY) for p in touched):
+        for x in c.exp:
+            q = policy.EXEC_QUIET.get(ids[x].rsplit("::", 1)[-1])
+            if q is not None and x not in fx:
+                proxy_p[x] = q
     c.proxy_probs = {}
     if regime != "cat" and not VERIFY_ALL and not any(p.startswith(EXEC_SIDE) for p in touched):
         eh = _num(ids, EXEC_TPCH)

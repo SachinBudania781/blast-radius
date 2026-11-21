@@ -67,6 +67,11 @@ def prob(test_id, regime, n_cheap, dedicated=False):
     return 0.5  # unknown: nothing cheap to learn from
 
 
+# executor-side changes (executor/, planner.py, the python generator) that no cheap candidate
+# catches: test_execute_tpcds failed 0/13 in the validator/campaign mutants
+EXEC_QUIET = {"test_execute_tpcds": 0.05, "test_optimized_tpch": 0.05}
+
+
 # narrow regime, refined by what the cheap tests of the expensive test's own class did and by
 # the share of all cheap candidates that failed (validator + campaign mutants, smoothed):
 #   same class all passed, <2% failing: 2/94 failed; 2-10%: 3/25; >=10%: 2/14
@@ -159,7 +164,8 @@ def early_stop_ok(cheap, exp_tests, ms, ids, run_ms=None, dedicated=frozenset(),
     # can make a big test unlikely to fail: stop early only if it is added even then
     low = {x: f.get(x, 0.02) for x in exp_tests}
     b_low, v_low = decide(exp_tests, set(), "narrow", len(cheap), ms, ids, run_ms, dedicated, pmap=low, cpu=cpu)
-    if not b_narrow or not (b_cat == b_broad == b_narrow == b_low) or not (v_cat == v_broad == v_narrow == v_low):
+    # (requiring the same decision at low odds cost ~11 s CPU on practice and saved nothing)
+    if not b_narrow or not (b_cat == b_broad == b_narrow) or not (v_cat == v_broad == v_narrow):
         return None
     full = pack_cost(set(cheap) | b_narrow, ms)
     lean = pack_cost(b_narrow, ms)
