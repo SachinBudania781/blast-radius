@@ -39,6 +39,7 @@ PDIAG = os.environ.get("BR_PDIAG") == "1"  # measurement build: why was a passin
 CDIAG = os.environ.get("BR_CDIAG") == "1"  # measurement build: where the CPU goes
 CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "1.25"))  # scoring machine CPU / ours (measured tests)
 GEST = None
+PERSIST = os.environ.get("BR_PERSIST", "1") == "1"  # phase 2 runs in the phase-1 child
 SLACK_KAPPA = float(os.environ.get("BR_SLACK", "0.5"))  # stop running cheap tests that fit next to the big unverified ones
 GUARD_THETA = float(os.environ.get("BR_GUARD_THETA", "1.0"))  # (0.8 cost +3.8 s on practice)
 CPU_BY_PHASE = {}  # measurement build: encode where unverified tests were wasted  # measurement mode (never include unverified, except catastrophic)
@@ -989,10 +990,19 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
                             gc.freeze()
                 except Exception as e:  # noqa: BLE001
                     log("precompute failed", repr(e))
+        ctl_r = ctl_w = None
         try:
             r, w = os.pipe()
+            if phase == 1 and PERSIST:
+                ctl_r, ctl_w = os.pipe()
             pid = os.fork()
         except OSError:
+            for fd_ in (ctl_r, ctl_w):
+                if fd_ is not None:
+                    try:
+                        os.close(fd_)
+                    except OSError:
+                        pass
             # cannot fork (process limit): include what we could not check
             c.failed |= set(tests)
             if phase == 1:
@@ -1002,6 +1012,8 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
         if pid == 0:
             try:
                 os.close(r)
+                if ctl_w is not None:
+                    os.close(ctl_w)
                 runner.build_overlay(SRC, ov, c.patched, c.deleted)
                 if runner.PRE_ROWS is not None and any(
                     ("_done", runner.TPC_SUB_OF_TEST.get(meta[t][3])) not in runner.PRE_ROWS
@@ -1028,7 +1040,7 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
                 runner.OPT_FILTER = getattr(c, "opt_filter", None)
                 imods = sorted(m for m in c.import_check if m.startswith("sqlglot/") or m.startswith("tests/"))
                 extra = None  # (runner.importers_closure narrows this; measured no gain, so all dialects)
-                runner.child_main(ov, tl, w, timeouts, 0, imods, set(c.patched) | set(c.deleted), probes=(getattr(c, "probes", None) or ()) if phase == 1 else (), import_extra=extra)
+                runner.child_main(ov, tl, w, timeouts, 0, imods, set(c.patched) | set(c.deleted), probes=(getattr(c, "probes", None) or ()) if phase == 1 else (), import_extra=extra, ctl_fd=ctl_r)
             except BaseException:
                 if os.environ.get("BR_CHILD_DEBUG"):
                     import traceback
@@ -1037,9 +1049,11 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
                         fh.write(traceback.format_exc())
             os._exit(0)
         os.close(w)
+        if ctl_r is not None:
+            os.close(ctl_r)
         budget = 15.0 + sum(ms[t] for t in tests) / 1000 * float(os.environ.get("BR_TIMEOUT_MULT", "5"))
         budget = min(budget, max(5.0, DEADLINE - time.time()))
-        running[r] = [pid, c, b"", time.time() + budget, tests, ov]
+        running[r] = [pid, c, b"", time.time() + budget, tests, ov, ctl_w]
         c.cur_tests = set(tests)
         return True
 
@@ -1074,7 +1088,7 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
         rl, _, _ = select.select(list(running), [], [], max(0.0, timeout))
         now = time.time()
         for fd in list(running):
-            pid, c, buf, deadline, tests, ov = running[fd]
+            pid, c, buf, deadline, tests, ov, ctl = running[fd]
             done = False
             if fd in rl:
                 try:
@@ -1107,6 +1121,48 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
                                 except OSError:
                                     pass
                                 done = True
+                    if not done and ctl is not None and b"-5 wait\n" in buf:
+                        # phase 1 finished in this child: decide, then run phase 2 in it
+                        head, _, tail = buf.partition(b"-5 wait\n")
+                        _ingest(c, head, tests, meta)
+                        nxt = _next_phase(c, ms, ids)
+                        payload = None
+                        # (TPC executor tests need data the parent prepares before forking: new child)
+                        if nxt and time.time() < DEADLINE - 5.0 and not any(meta[t][3] in runner.TPC_SUB_OF_TEST for t in nxt):
+                            import zlib as _z
+
+                            order = sorted(nxt, key=lambda t: (_z.crc32(f"{meta[t][1]}::{meta[t][2]}".encode()), meta[t][1], meta[t][2]))
+                            tm = float(os.environ.get("BR_TIMEOUT_MULT", "5"))
+                            tmo = {str(t): min(float(os.environ.get("BR_TIMEOUT_CAP", "45")), max(5.0, ms[t] / 1000 * tm + 3)) for t in nxt}
+                            payload = (json.dumps([[list(meta[t]) for t in order], tmo]) + "\n").encode()
+                        try:
+                            if payload:
+                                v = memoryview(payload)
+                                while v:
+                                    k = os.write(ctl, v)
+                                    v = v[k:]
+                        except OSError:
+                            payload = None
+                        try:
+                            os.close(ctl)
+                        except OSError:
+                            pass
+                        ctl = None
+                        if payload:
+                            b2 = 15.0 + sum(ms[t] for t in nxt) / 1000 * float(os.environ.get("BR_TIMEOUT_MULT", "5"))
+                            tail = b"-3 ready\n" + tail  # (the import checks passed in phase 1)
+                            running[fd] = [pid, c, tail, time.time() + min(b2, max(5.0, DEADLINE - time.time())), set(nxt), ov, None]
+                            c.cur_tests = set(nxt)
+                            buf = tail
+                            if b"\n" not in tail[len(b"-3 ready\n"):]:
+                                continue
+                        else:
+                            if nxt:
+                                queue.insert(0, (c, nxt, 2))
+                            else:
+                                _finish(c, ms)
+                            running[fd] = [pid, c, b"", deadline, None, ov, None]
+                            continue
                     gate = getattr(c, "early_gate", None)
                     if gate:
                         hit = any((b"\n" + buf).find(f"\n{g} 1\n".encode()) >= 0 for g in gate) or b"-1 " in buf or b"-2 " in buf
@@ -1130,16 +1186,23 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
                 done = True
             if done:
                 os.close(fd)
+                if ctl is not None:
+                    try:
+                        os.close(ctl)
+                    except OSError:
+                        pass
                 try:
                     _, _, ru = os.wait4(pid, 0)
                     c.cpu = getattr(c, "cpu", 0.0) + ru.ru_utime + ru.ru_stime
                     CPU_BY_PHASE[c.phase] = CPU_BY_PHASE.get(c.phase, 0.0) + ru.ru_utime + ru.ru_stime
                     if DEBUG:
-                        log(f"job {c.cid} phase{c.phase} tests={len(tests)} rec={sum(ms[t] for t in tests)/1000:.2f}s cpu={ru.ru_utime + ru.ru_stime:.2f}s")
+                        log(f"job {c.cid} phase{c.phase} tests={len(tests or ())} rec={sum(ms[t] for t in tests or ())/1000:.2f}s cpu={ru.ru_utime + ru.ru_stime:.2f}s")
                 except OSError:
                     pass
                 del running[fd]
                 _cleanup(ov)
+                if tests is None:
+                    continue  # (phase 1 already handled; the child had nothing more to run)
                 _ingest(c, buf, tests, meta)
                 nxt = _next_phase(c, ms, ids)
                 if nxt:

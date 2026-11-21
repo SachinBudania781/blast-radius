@@ -453,7 +453,7 @@ def importers_closure(root, rels, patched=None):
     return sorted(found)
 
 
-def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patched=(), probes=(), import_extra=None):
+def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patched=(), probes=(), import_extra=None, ctl_fd=None):
     """tests: list of (number, file, cls, name). Runs in the forked child."""
     # if memory runs out, the kernel should kill this child, never the parent
     try:
@@ -572,11 +572,6 @@ def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patc
     out.write("-3 ready\n")
     out.flush()
 
-    # group by file then class, keeping order
-    by_file = {}
-    for num, file, cls, name in tests:
-        by_file.setdefault(file, []).append((num, cls, name))
-
     class Result(unittest.TestResult):
         def __init__(self):
             super().__init__()
@@ -640,10 +635,58 @@ def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patc
         def addUnexpectedSuccess(self, test):
             self._mark(test)
 
+    imported = {}
+    run_batch(tests, imported, out, report, Result, patched)
+    for num, name in probes:
+        fn = PROBES.get(name)
+        ok = False
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 30.0)
+            ok = bool(fn())
+        except BaseException:
+            ok = False
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        try:
+            out.write(f"probe {num} {'ok' if ok else 'bad'}\n")
+            out.flush()
+        except Exception:
+            pass
+    if ctl_fd is not None:
+        # phase 1 done: the parent may send the phase-2 tests to run here (saves a new child's
+        # imports); EOF without data means nothing more to run
+        try:
+            out.write("-5 wait\n")
+            out.flush()
+            data = b""
+            while True:
+                chunk = os.read(ctl_fd, 65536)
+                if not chunk:
+                    break
+                data += chunk
+            if data.strip():
+                import json
+
+                batch, tmo = json.loads(data.decode())
+                timeouts.update({int(k): float(v) for k, v in tmo.items()})
+                run_batch([tuple(x) for x in batch], imported, out, report, Result, patched)
+        except BaseException:
+            pass
+    os._exit(0)
+
+
+def run_batch(tests, imported, out, report, Result, patched):
+    import unittest
+
+    # group by file then class, keeping order
+    by_file = {}
+    for num, file, cls, name in tests:
+        by_file.setdefault(file, []).append((num, cls, name))
     # like pytest: import every test module before running any test (tests may patch
     # sys.modules / environment while they run, which must not affect later imports)
-    imported = {}
     for file in by_file:
+        if file in imported:
+            continue
         modname = file[:-3].replace("/", ".")
         try:
             signal.setitimer(signal.ITIMER_REAL, float(os.environ.get("BR_IMPORT_TIMEOUT", "60")))
@@ -723,19 +766,3 @@ def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patc
             except Exception:
                 pass
     out.flush()
-    for num, name in probes:
-        fn = PROBES.get(name)
-        ok = False
-        try:
-            signal.setitimer(signal.ITIMER_REAL, 30.0)
-            ok = bool(fn())
-        except BaseException:
-            ok = False
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-        try:
-            out.write(f"probe {num} {'ok' if ok else 'bad'}\n")
-            out.flush()
-        except Exception:
-            pass
-    os._exit(0)
