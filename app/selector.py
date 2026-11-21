@@ -1307,6 +1307,13 @@ def _next_phase(c, ms, ids):
                 else:
                     p_ok, p_bad = 0.02, 0.6
                     proxy_p[ex] = 0.07
+            elif ex_id == EXEC_TPCDS and regime in ("narrow", "broad") and oh_ is not None and oh_ in c.cheap and oh_ in c.reported and oh_ not in fx and oh_ not in c.failed:
+                # test_execute_tpch not a candidate, optimizer test_tpch ran and passed while other
+                # cheap tests failed: test_execute_tpcds failed 0/14, test_tpcds 1/19 (mutants)
+                proxy_p[ex] = min(0.08, proxy_p.get(ex, 1.0))
+                od_ = _num(ids, px_id)
+                if od_ is not None and od_ in c.exp and od_ not in probed:
+                    proxy_p[od_] = 0.1
             if px in c.cheap:
                 proxy_p[ex] = p_bad if px in c.failed else p_ok
             elif px in c.exp and px not in fx:
@@ -1364,7 +1371,7 @@ def _next_phase(c, ms, ids):
     c.why = {x: ("proxy" if x in (pmap or {}) and x in proxy_p else regime) for x in blind}
     if DEBUG:
         nm = lambda xs: sorted(ids[x].rsplit("::", 1)[-1] for x in xs)  # noqa: E731
-        log(f"decide {c.cid} {regime} n={n_cheap} nf={nf} blind={nm(blind)} verify={nm(verify)} deferred={nm(deferred)} exp={nm(c.exp)}")
+        log(f"decide {c.cid} {regime} n={n_cheap} nf={nf} blind={nm(blind)} verify={nm(verify)} deferred={nm(deferred)} exp={nm(c.exp)} p={ {ids[k].rsplit('::', 1)[-1]: round(v, 3) for k, v in (pmap or {}).items()} } tpc={(eh_ in c.cheap, eh_ in c.failed, oh_ in c.cheap, oh_ in c.failed)}")
     return verify or None
 
 
