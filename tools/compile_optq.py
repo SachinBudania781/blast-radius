@@ -14,5 +14,12 @@ for name, v in d.items():
             m = idx.setdefault(f, {})
             m[ln] = m.get(ln, 0) | (1 << j)
     res[num[name]] = ([(r[0], r[1]) for r in runs], [r[3] / tot for r in runs], idx)
-marshal.dump(res, open(out, "wb"))
+import os
+d = os.path.dirname(out)
+for f in os.listdir(d):
+    if f.startswith("optq_") and f.endswith(".m"):
+        os.remove(os.path.join(d, f))
+for num, v in res.items():
+    marshal.dump(v, open(os.path.join(d, f"optq_{num}.m"), "wb"))
+marshal.dump(sorted(res), open(out, "wb"))  # index: test numbers that have a per-query map
 print(len(res), "tests", file=sys.stderr)

@@ -392,14 +392,29 @@ def _tpcq():
 _OPTQ = None
 
 
+_OPTQ_DATA = {}
+
+
 def _optq():
+    """Index of tests with a per-query map (data loaded per test on demand)."""
     global _OPTQ
     if _OPTQ is None:
         try:
-            _OPTQ = marshal.load(open(os.path.join(MAPS, "optq.m"), "rb"))
+            _OPTQ = set(marshal.load(open(os.path.join(MAPS, "optq.m"), "rb")))
         except Exception:
-            _OPTQ = {}
+            _OPTQ = set()
     return _OPTQ
+
+
+def _optq_test(x):
+    v = _OPTQ_DATA.get(x)
+    if v is None:
+        try:
+            v = marshal.load(open(os.path.join(MAPS, f"optq_{x}.m"), "rb"))
+        except Exception:
+            v = False
+        _OPTQ_DATA[x] = v
+    return v
 
 
 def _line_mask(c, maps, x, idx, nruns):
@@ -435,7 +450,10 @@ def opt_query_filter(c, maps, meta):
             oq = _optq()
         if x not in oq:
             continue
-        runs, weights, idx = oq[x]
+        data = _optq_test(x)
+        if not data:
+            continue
+        runs, weights, idx = data
         m = _line_mask(c, maps, x, idx, len(runs))
         sel = [j for j in range(len(runs)) if m >> j & 1]
         if len(sel) == len(runs):
