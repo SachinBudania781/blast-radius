@@ -77,7 +77,119 @@ def _write(path, data):
     os.utime(path, (1, 1))
 
 
-def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=()):
+PRE_ROWS = None
+
+
+def _parse_rows(file_name):
+    import ast
+    import csv
+    import gzip
+
+    with open(file_name, "rb") as f:
+        gz = f.read(2) == b"\x1f\x8b"
+    fh = gzip.open(file_name, "rt", newline="") if gz else open(file_name, encoding="utf-8", newline="")
+    reader = csv.reader(fh, delimiter="|")
+    rows = []
+    ctypes = []
+    next(reader)
+    for row in reader:
+        if not ctypes:
+            for i, v in enumerate(row):
+                try:
+                    ctypes.append(type(ast.literal_eval(v)))
+                except (ValueError, SyntaxError):
+                    ctypes.append(str)
+        rows.append(tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row)))
+    fh.close()
+    return rows
+
+
+def precompute_executor_rows(src):
+    """Parse the TPC-H/TPC-DS CSVs once in the parent, exactly like TestExecutor.setUpClass."""
+    global PRE_ROWS
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_br_helpers", os.path.join(src, "tests", "helpers.py"))
+    h = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(h)
+    pre = {}
+    for sub, schema in (("tpc-h", h.TPCH_SCHEMA), ("tpc-ds", h.TPCDS_SCHEMA)):
+        for table in schema:
+            pre[(sub, table)] = _parse_rows(os.path.join(src, "tests", "fixtures", "optimizer", sub, f"{table}.csv.gz"))
+    PRE_ROWS = pre
+
+
+def _install_fast_executor_setup(mod, patched):
+    if PRE_ROWS is None:
+        return
+    for rel in patched:
+        if rel in ("tests/test_executor.py", "tests/helpers.py") or rel.startswith("tests/fixtures/optimizer/tpc-"):
+            return
+    klass = getattr(mod, "TestExecutor", None)
+    if klass is None:
+        return
+
+    class LazyConn:
+        """duckdb connection whose CREATE VIEW statements run on first use (most
+        executor tests never touch duckdb, and binding 32 CSV views costs ~0.7 s)."""
+
+        def __init__(self):
+            self._conn = None
+            self._pending = []
+
+        def _real(self):
+            if self._conn is None:
+                self._conn = mod.duckdb.connect()
+                for q in self._pending:
+                    self._conn.execute(q)
+                self._pending = None
+            return self._conn
+
+        def defer(self, q):
+            if self._conn is None:
+                self._pending.append(q)
+            else:
+                self._conn.execute(q)
+
+        def close(self):
+            if self._conn is not None:
+                self._conn.close()
+
+        def __getattr__(self, name):
+            return getattr(self._real(), name)
+
+    def setUpClass(cls):
+        Table = mod.Table
+        cls.tpch_conn = LazyConn()
+        cls.tpcds_conn = LazyConn()
+        cls.tpch_tables = {}
+        cls.tpcds_tables = {}
+
+        def setup(conn, directory, sub, table, columns, tables):
+            file_name = f"{directory}{table}.csv.gz"
+            conn.defer(
+                f"""
+                CREATE VIEW {table} AS
+                SELECT *
+                FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
+                """
+            )
+            rows = list(PRE_ROWS[(sub, table)])
+            tables[table] = rows
+            tables[table] = Table(columns=columns, rows=rows)
+
+        for table, columns in mod.TPCH_SCHEMA.items():
+            setup(cls.tpch_conn, mod.DIR_TPCH, "tpc-h", table, columns, cls.tpch_tables)
+        for table, columns in mod.TPCDS_SCHEMA.items():
+            setup(cls.tpcds_conn, mod.DIR_TPCDS, "tpc-ds", table, columns, cls.tpcds_tables)
+        cls.cache = {}
+        cls.tpch_sqls = list(mod.load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
+        cls.tpcds_sqls = list(mod.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+
+    klass.setUpClass = classmethod(setUpClass)
+
+
+def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patched=()):
     """tests: list of (number, file, cls, name). Runs in the forked child."""
     # never let a test write to the real stdout (it would corrupt the answer stream)
     try:
@@ -204,6 +316,8 @@ def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=()):
             signal.setitimer(signal.ITIMER_REAL, 30.0)
             mod = __import__(modname, fromlist=["_"])
             signal.setitimer(signal.ITIMER_REAL, 0)
+            if modname == "tests.test_executor":
+                _install_fast_executor_setup(mod, patched)
         except BaseException:
             signal.setitimer(signal.ITIMER_REAL, 0)
             out.write(f"{FAIL_ALL_IN_FILE} {file}\n")

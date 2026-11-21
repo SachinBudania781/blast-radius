@@ -239,11 +239,13 @@ for f in glob.glob(os.path.join(MAPDIR, "map-*.pkl")):
 _attr_cache = {}
 
 
-def attr_runtime_readers(nm):
-    """Tests that run a line reading attribute/name nm at runtime, or None when nm is also
-    read at import time, read by string (getattr), or referenced by a bare name."""
-    if nm in _attr_cache:
-        return _attr_cache[nm]
+def attr_runtime_readers(nm, fam_quals=()):
+    """Tests that run a line reading class attribute nm at runtime, or None when nm is also
+    read at import time, read via getattr with a string, or used by bare name inside the
+    class body of the same class family (a derived class attribute)."""
+    key = (nm, tuple(sorted(fam_quals)))
+    if key in _attr_cache:
+        return _attr_cache[key]
     d = name_refs.get(nm, {})
     out = set()
     ok = True
@@ -254,10 +256,17 @@ def attr_runtime_readers(nm):
                 continue
             st = a["line_stmt"][ln] if ln < len(a["line_stmt"]) else None
             lo, hi = st if st else (ln, ln)
-            if owner == '"' or owner is None:
-                # bare-name use: only fine inside the class body itself (def-time) -> not narrowable
+            if owner == '"':
                 ok = False
                 break
+            if owner is None:
+                # bare names inside methods/modules are locals/globals, not this attribute;
+                # inside a class body of the same family they derive another attribute
+                chain = scope_chain(a, ln)
+                if chain and chain[0].kind == "class" and class_qual(rel, chain[0]) in fam_quals:
+                    ok = False
+                    break
+                continue
             chain = scope_chain(a, ln)
             runtime = ln in a["runtime"] and any(sc.kind in ("func", "lambda") for sc in chain[:-1])
             if not runtime or any((rel, x) in import_exec for x in range(lo, hi + 1)):
@@ -266,8 +275,10 @@ def attr_runtime_readers(nm):
             out |= stmt_cov(rel, a, lo, hi)
         if not ok:
             break
-    _attr_cache[nm] = out if ok else None
-    return _attr_cache[nm]
+    # dynamic getattr sites in sqlglot only fetch *_sql methods, classes by name, or
+    # instance fields (checked by hand at the pinned commit), never class data attributes
+    _attr_cache[key] = out if ok else None
+    return _attr_cache[key]
 
 
 files_out = {}
@@ -296,6 +307,11 @@ for rel, a in infos.items():
         inner = chain[0]
         s = set(rd)
         w = set()
+        if lo in a["docstring_lines"] and all(x in a["docstring_lines"] for x in range(lo, hi + 1)):
+            # docstrings have no runtime effect here (doctests are not collected by pytest)
+            narrow[ln] = sid(s)
+            wide[ln] = narrow[ln]
+            continue
         # lambda body?
         lam_hit = None
         for (ll, blo, bhi) in lam:
@@ -351,10 +367,11 @@ for rel, a in infos.items():
                 names = a["defined"].get(lo, set())
                 is_def = any(sc.start == lo and sc.kind in ("func", "class") for sc in a["scopes"][1:])
                 narrowed = None
+                fam_quals = {q for q, info in classes.items() if cq in info["mro"]} | {cq}
                 if names and not is_def:
                     narrowed = set()
                     for nm in names:
-                        r = attr_runtime_readers(nm)
+                        r = attr_runtime_readers(nm, fam_quals)
                         if r is None:
                             narrowed = None
                             break

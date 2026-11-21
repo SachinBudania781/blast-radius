@@ -18,6 +18,7 @@ APP = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, APP)
 
 import patchutil  # noqa: E402
+import policy  # noqa: E402
 
 SRC = os.environ.get("BR_SRC", "/app/sqlglot")
 DATA = os.environ.get("BR_DATA", "/data")
@@ -222,6 +223,7 @@ class Commit:
         self.deleted = set()
         self.cands = set()
         self.always = set()  # tests that fail for sure (no need to run)
+        self.sure = set()  # tests we include without running (expected to fail)
         self.import_check = set()  # python module relpaths to import first
         self.import_fail_sets = {}  # relpath -> tests failing if import fails
         self.unknown = False
@@ -279,9 +281,17 @@ def analyze(cid, data, maps, ntests, all_tests):
         info = maps.file(old)
         if info is None:
             # non-python or python file the maps do not cover
-            c.cands |= maps.readers(old)
+            rd = maps.readers(old)
             if old.endswith(".py") and (old.startswith("sqlglot/") or old.startswith("tests/")):
                 c.unknown = True
+                continue
+            if old.endswith(".sql") and old.startswith("tests/fixtures/"):
+                if _sql_fixture_harmless(fp):
+                    continue
+                # an edited fixture query nearly always breaks the tests reading it
+                c.sure |= rd
+                c.fixture_readers = getattr(c, "fixture_readers", set()) | rd
+            c.cands |= rd
             continue
         narrow, wide, rd, mu, sspans, bslash, fspans = info
         c.cands |= maps.set(rd)
@@ -311,6 +321,16 @@ def analyze(cid, data, maps, ntests, all_tests):
                 if DEBUG:
                     c.notes.append(f"import-check {old}")
     return c
+
+
+def _sql_fixture_harmless(fp):
+    """tests/helpers.py drops empty lines and lines starting with '--' before use."""
+    for removed, rtxt, added in patchutil.changes(fp):
+        for t in list(rtxt) + [x for _, x in added]:
+            t = t.rstrip(b"\r")
+            if t and not t.startswith(b"--"):
+                return False
+    return True
 
 
 def _deleted_file(c, rel, maps):
@@ -393,16 +413,24 @@ def main():
         if c.unknown:
             c.result = set(all_tests)
             continue
-        cand = c.cands - c.always
+        c.sure = {t for t in c.sure if ms[t] < EXPENSIVE * 1000}
+        cand = c.cands - c.always - c.sure
         cheap = {t for t in cand if ms[t] < EXPENSIVE * 1000}
         exp_ = cand - cheap
         c.cheap, c.exp = cheap, exp_
+        if cheap and policy.CPU_RATIO * sum(ms[t] for t in cheap) > policy.pack_cost(cheap | exp_ | c.sure | c.always, ms) and not c.import_check:
+            # running them would cost more than just including them
+            c.result = cheap | exp_ | c.sure | c.always
+            continue
         if not cheap and not exp_ and not c.import_check:
-            c.result = set(c.always)
+            c.result = set(c.always) | c.sure
             continue
         jobs.append(c)
 
-    run_jobs(jobs, meta, ms, maps)
+    ids = [t["id"] for t in tests]
+    for c in jobs:
+        c.early_blind = policy.early_stop_ok(c.cheap, c.exp, ms, ids)
+    run_jobs(jobs, meta, ms, maps, ids)
 
     out = sys.stdout
     for c in commits:
@@ -416,7 +444,9 @@ def main():
     log(f"done {len(commits)} commits in {time.time() - t_start:.1f}s")
 
 
-def run_jobs(jobs, meta, ms, maps):
+def run_jobs(jobs, meta, ms, maps, ids=None):
+    if ids is None:
+        ids = [f"{m[1]}::{m[2]}::{m[3]}" for m in meta]
     import runner
 
     # preload heavy third-party modules used by the test files we are going to import
@@ -425,6 +455,11 @@ def run_jobs(jobs, meta, ms, maps):
         for t in c.cheap | c.exp:
             files.add(meta[t][1])
     _preload(files)
+    if any(meta[t][1] == "tests/test_executor.py" and meta[t][2] == "TestExecutor" for c in jobs for t in c.cheap | c.exp):
+        try:
+            runner.precompute_executor_rows(SRC)
+        except Exception as e:  # noqa: BLE001
+            log("precompute failed", repr(e))
 
     pending = []
     for c in jobs:
@@ -449,7 +484,7 @@ def run_jobs(jobs, meta, ms, maps):
                 runner.build_overlay(SRC, ov, c.patched, c.deleted)
                 tl = [meta[t] for t in sorted(tests, key=lambda t: (meta[t][1], meta[t][2]))]
                 timeouts = {t: max(3.0, ms[t] / 1000 * 3 + 2) for t in tests}
-                runner.child_main(ov, tl, w, timeouts, 0, sorted(m for m in c.import_check if m.startswith("sqlglot/") or m.startswith("tests/")))
+                runner.child_main(ov, tl, w, timeouts, 0, sorted(m for m in c.import_check if m.startswith("sqlglot/") or m.startswith("tests/")), set(c.patched) | set(c.deleted))
             except BaseException:
                 pass
             os._exit(0)
@@ -461,11 +496,14 @@ def run_jobs(jobs, meta, ms, maps):
 
     queue = []
     for c in pending:
-        tests = set(c.cheap)
-        if not c.cheap:
-            tests = set(c.exp)
-            c.phase = 2
-        queue.append((c, tests, c.phase))
+        if not c.cheap and not c.import_check:
+            nxt = _next_phase(c, ms, ids)
+            if nxt:
+                queue.append((c, nxt, 2))
+            else:
+                _finish(c, ms)
+            continue
+        queue.append((c, set(c.cheap), 1))
 
     while queue or running:
         while queue and len(running) < PAR:
@@ -494,6 +532,14 @@ def run_jobs(jobs, meta, ms, maps):
                 if chunk:
                     buf += chunk
                     running[fd][2] = buf
+                    if c.phase == 1 and getattr(c, "early_blind", None) and (b" 1\n" in buf or buf.startswith(b"-")):
+                        # live change and a big test goes on its own worker anyway: stop here
+                        c.early_stopped = True
+                        try:
+                            os.kill(pid, 9)
+                        except OSError:
+                            pass
+                        done = True
                 else:
                     done = True
             if not done and now > deadline:
@@ -514,7 +560,7 @@ def run_jobs(jobs, meta, ms, maps):
                 del running[fd]
                 _cleanup(ov)
                 _ingest(c, buf, tests, meta)
-                nxt = _next_phase(c, ms)
+                nxt = _next_phase(c, ms, ids)
                 if nxt:
                     queue.insert(0, (c, nxt, 2))
                 else:
@@ -548,22 +594,32 @@ def _ingest(c, buf, tests, meta):
             c.failed.add(t)
 
 
-def _next_phase(c, ms):
-    if c.phase == 1:
-        c.phase = 2
-        if c.exp:
-            if c.import_failed:
-                return None
-            if c.failed & c.cheap:
-                # the change is live: expensive candidates very likely fail too
-                c.blind = set(c.exp)
-                return None
-            return set(c.exp)
-    return None
+def _next_phase(c, ms, ids):
+    if c.phase != 1:
+        return None
+    c.phase = 2
+    if c.import_failed:
+        return None
+    base = set(c.always) | set(c.sure)
+    if getattr(c, "early_stopped", False):
+        # everything cheap goes in unverified, next to the big blind test(s)
+        c.blind = set(c.cheap) | set(c.early_blind)
+        rest = set(c.exp) - c.blind
+        blind, verify = policy.decide(rest, base | c.blind, True, ms, ids)
+        c.blind |= blind
+        return verify or None
+    if not c.cheap:
+        live = True  # nothing cheap to learn from: be conservative
+    else:
+        live = bool(c.failed & c.cheap)
+    base |= c.failed & c.cheap
+    blind, verify = policy.decide(c.exp, base, live, ms, ids)
+    c.blind = blind
+    return verify or None
 
 
 def _finish(c, ms):
-    res = set(c.failed) | c.always | getattr(c, "blind", set())
+    res = set(c.failed) | c.always | c.sure | getattr(c, "blind", set())
     for m in c.import_failed:
         res |= c.import_fail_sets.get(m, set())
     for f in c.file_fail:

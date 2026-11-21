@@ -162,8 +162,15 @@ def analyze(source: str):
                 if not isinstance(n.ctx, ast.Load):
                     continue
                 refs_names.setdefault(n.end_lineno, set()).add((owner_of(n.value), n.attr))
-            elif isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value.isidentifier():
-                refs_names.setdefault(n.lineno, set()).add(('"', n.value))
+            elif isinstance(n, ast.Call):
+                f = n.func
+                fname = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else None)
+                if fname in ("getattr", "hasattr", "setattr", "delattr") and len(n.args) >= 2:
+                    a1 = n.args[1]
+                    if isinstance(a1, ast.Constant) and isinstance(a1.value, str):
+                        refs_names.setdefault(n.lineno, set()).add(('"', a1.value))
+                    elif not isinstance(a1, ast.Constant):
+                        refs_names.setdefault(n.lineno, set()).add(('"', "*dynamic*"))
 
     def collect_lambdas(node, scope_idx):
         # lambdas / comprehensions inside def-time statements run later (lambdas) -> runtime scope
