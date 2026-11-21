@@ -34,7 +34,8 @@ TMP = os.environ.get("BR_TMP", "/tmp")
 PAR = int(os.environ.get("BR_PAR", "2"))
 DEBUG = os.environ.get("BR_DEBUG") == "1"
 VERIFY_ALL = os.environ.get("BR_VERIFY_ALL") == "1"
-DIAG = os.environ.get("BR_DIAG") == "1"  # measurement build: encode where unverified tests were wasted  # measurement mode (never include unverified, except catastrophic)
+DIAG = os.environ.get("BR_DIAG") == "1"
+PDIAG = os.environ.get("BR_PDIAG") == "1"  # measurement build: why was a passing TPC-DS run added  # measurement build: encode where unverified tests were wasted  # measurement mode (never include unverified, except catastrophic)
 
 # tests with a cheap stand-in in runner.PROBES
 PROBE_IDS = ("tests/test_generator.py::TestGenerator::test_generator_memory", "tests/test_parser.py::TestParser::test_max_nodes")
@@ -724,6 +725,11 @@ def main():
             _diag(outs, tests, meta, ms, maps, ids)
         except Exception as e:  # noqa: BLE001
             log("diag failed", repr(e))
+    if PDIAG:
+        try:
+            _pdiag(outs, tests, meta, ms, maps, ids)
+        except Exception as e:  # noqa: BLE001
+            log("pdiag failed", repr(e))
     out = sys.stdout
     for c, res, workers in outs:
         out.write(json.dumps({"commit": c.cid, "workers": workers}, separators=(",", ":")) + "\n")
@@ -797,6 +803,72 @@ def _diag(outs, tests, meta, ms, maps, ids):
         if cand:
             o[2].append([cand[0]])
     zeros = n_x + 20 * n_c
+    for o in outs:
+        if zeros <= 0:
+            break
+        used = {x for w in o[2] for x in w}
+        for x in pool.get(0.0, []):
+            if zeros <= 0 or len(o[2]) >= 8:
+                break
+            if x in o[1] or x in used:
+                continue
+            o[2].append([x])
+            used.add(x)
+            zeros -= 1
+
+
+PATH_CODE = {"cat": 1, "early": 2, "broad": 3, "narrow": 4, "dead": 5, "unknown": 6, "proxy": 7, "deferred": 8}
+
+
+def _pdiag(outs, tests, meta, ms, maps, ids):
+    """Measurement build: for commits whose output has test_execute_tpcds without having run
+    it, run it; for those where it passes, encode why it was added: extra 0-second workers
+    (+2 s each) = code1 + 10 * code2 (first two such commits), and on empty commits one
+    0.001 worker per such commit and 0.010 x flags of the first (1 executor-side change,
+    2 execute_tpch ran and passed, 4 it ran and failed).
+    Codes: 1 cat, 2 early stop, 3 broad, 4 narrow, 5 dead, 6 unknown, 7 proxy, 8 deferred,
+    9 whole-commit / import-expansion / other."""
+    ex = _num(ids, EXEC_TPCDS)
+    eh = _num(ids, EXEC_TPCH)
+    djobs = []
+    for c, res, workers in outs:
+        if c.unknown or ex not in res or ex in getattr(c, "reported", set()):
+            continue
+        d = Commit(c.cid)
+        d.patched, d.deleted = c.patched, c.deleted
+        d.cheap, d.exp, d.sure, d.always = {ex}, set(), set(), set()
+        d.import_check, d.import_fail_sets, d.probes, d.early_blind = set(), {}, [], None
+        for k in ("tpc_filter", "opt_filter", "run_ms"):
+            setattr(d, k, getattr(c, k, None))
+        d.orig = c
+        djobs.append(d)
+    run_jobs(djobs, meta, ms, maps, ids)
+    found = []
+    for d in djobs:
+        if ex in d.failed:
+            continue
+        c = d.orig
+        why = getattr(c, "why", {}).get(ex)
+        code = PATH_CODE.get(why, 9)
+        flags = 0
+        if all(p.startswith(EXEC_SIDE) for p in (set(c.patched) | set(c.deleted)) or {""}):
+            flags |= 1
+        if eh in getattr(c, "reported", set()):
+            flags |= 4 if eh in c.failed else 2
+        found.append((code, flags))
+        log(f"pdiag {c.cid} wasted tpcds why={why} code={code} flags={flags} regime={getattr(c, 'regime', None)} guard={getattr(c, 'guard', False)}")
+    n = min(len(found), 9)
+    zeros = (found[0][0] if found else 0) + (10 * found[1][0] if len(found) > 1 else 0)
+    log(f"pdiag n={len(found)} zeros={zeros} found={found}")
+    pool = {}
+    for t in tests:
+        pool.setdefault(t["seconds"], []).append(t["number"])
+    empties = [o for o in outs if not o[2]]
+    decimals = [0.001] * n + ([0.010] * found[0][1] if found else [])
+    for o, sec in zip(empties, decimals):
+        cand = [x for x in pool.get(sec, []) if x not in o[1]]
+        if cand:
+            o[2].append([cand[0]])
     for o in outs:
         if zeros <= 0:
             break
@@ -1097,6 +1169,8 @@ def _finish_deferred(c, ms, ids):
         m = policy.pack_cost(cur | {ex}, ms) - policy.pack_cost(cur, ms)
         if policy.MISS_MS * p > m:
             c.blind = set(getattr(c, "blind", set())) | {ex}
+            c.why = dict(getattr(c, "why", {}))
+            c.why[ex] = "deferred"
             cur.add(ex)
     c.deferred = None
 
@@ -1115,6 +1189,7 @@ def _next_phase(c, ms, ids):
     if getattr(c, "early_stopped", False):
         # everything cheap goes in unverified, next to the big blind test(s)
         c.blind = set(c.cheap) | set(c.early_blind)
+        c.why = {x: "early" for x in c.blind}
         rest = set(c.exp) - c.blind
         blind, verify = policy.decide(rest, base | c.blind, "cat", n_cheap, ms, ids, getattr(c, "run_ms", None), c.dedicated, cpu=getattr(c, "cpu_cost", None))
         c.blind |= blind
@@ -1239,6 +1314,7 @@ def _next_phase(c, ms, ids):
         verify |= blind
         blind = set()
     c.blind = blind
+    c.why = {x: ("proxy" if x in (pmap or {}) and x in proxy_p else regime) for x in blind}
     if DEBUG:
         nm = lambda xs: sorted(ids[x].rsplit("::", 1)[-1] for x in xs)  # noqa: E731
         log(f"decide {c.cid} {regime} n={n_cheap} nf={nf} blind={nm(blind)} verify={nm(verify)} deferred={nm(deferred)} exp={nm(c.exp)}")
