@@ -37,6 +37,8 @@ VERIFY_ALL = os.environ.get("BR_VERIFY_ALL") == "1"
 DIAG = os.environ.get("BR_DIAG") == "1"
 PDIAG = os.environ.get("BR_PDIAG") == "1"  # measurement build: why was a passing TPC-DS run added
 CDIAG = os.environ.get("BR_CDIAG") == "1"  # measurement build: where the CPU goes
+CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "1.25"))  # scoring machine CPU / ours (measured tests)
+GEST = None
 CPU_BY_PHASE = {}  # measurement build: encode where unverified tests were wasted  # measurement mode (never include unverified, except catastrophic)
 
 # tests with a cheap stand-in in runner.PROBES
@@ -617,7 +619,8 @@ def _plan_one(c, ms, est, meta, tests, maps, all_tests):
     exp_ = cand - cheap
     c.cheap, c.exp = cheap, exp_
     c.run_ms = run_ms
-    c.cpu_cost = {x: est[x] * (run_ms[x] / ms[x] if x in run_ms and ms[x] > 0 else 1.0) for x in exp_}
+    gest = GEST or est
+    c.cpu_cost = {x: gest[x] * (run_ms[x] / ms[x] if x in run_ms and ms[x] > 0 else 1.0) for x in exp_}
     # cheap stand-ins for the slowest tests, run after the cheap ones
     # (not when the test's own file is edited: the stand-in would not see the edit)
     c.probes = [] if VERIFY_ALL else [
@@ -625,7 +628,7 @@ def _plan_one(c, ms, est, meta, tests, maps, all_tests):
         if tests[x]["id"] in PROBE_IDS and tests[x]["file"] not in c.patched and tests[x]["file"] not in c.deleted
     ]
     run_cost = sum(
-        est[t] * (run_ms[t] / ms[t] if t in run_ms else 1.0) if ms[t] >= EXPENSIVE * 1000 else policy.CPU_RATIO * run_ms.get(t, ms[t])
+        gest[t] * (run_ms[t] / ms[t] if t in run_ms else 1.0) if ms[t] >= EXPENSIVE * 1000 else policy.CPU_RATIO * run_ms.get(t, ms[t])
         for t in cheap
     )
     if not VERIFY_ALL and cheap and run_cost > policy.pack_cost(cheap | exp_ | c.sure | c.always, ms):
@@ -661,6 +664,9 @@ def main():
     except Exception:
         cpu_map = {}
     est = [cpu_map.get(t["id"], ms[t["number"]] * policy.CPU_RATIO) for t in tests]
+    global GEST
+    # measured CPU is from our machine; the scoring machine ran a TPC-DS check ~1.25x slower
+    GEST = [cpu_map[t["id"]] * CPU_SCALE if t["id"] in cpu_map else est[i] for i, t in enumerate(tests)]
     global _MAPS, _META
     _MAPS = maps
     _META = meta
