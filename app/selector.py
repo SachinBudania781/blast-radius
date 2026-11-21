@@ -717,7 +717,7 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
     _preload(files)
     if any(meta[t][1] == "tests/test_executor.py" and meta[t][2] == "TestExecutor" for c in jobs for t in c.cheap | c.exp):
         try:
-            runner.precompute_executor_rows(SRC)
+            runner.precompute_executor_rows(SRC, subs=())  # rows are parsed when a test needs them
         except Exception as e:  # noqa: BLE001
             log("precompute failed", repr(e))
 
@@ -743,6 +743,18 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
         ov = os.path.join(TMP, f"w{os.getpid()}_{seq}")
         if os.path.lexists(ov):
             _cleanup(ov)
+        if runner.PRE_ROWS is not None:
+            subs = {runner.TPC_SUB_OF_TEST[meta[t][3]] for t in tests if meta[t][3] in runner.TPC_SUB_OF_TEST}
+            if subs:
+                try:
+                    if not all(("_done", x) in runner.PRE_ROWS for x in subs):
+                        runner.precompute_executor_rows(SRC, subs=tuple(sorted(subs)))
+                        if os.environ.get("BR_GC_FREEZE", "1") == "1":
+                            import gc
+
+                            gc.freeze()
+                except Exception as e:  # noqa: BLE001
+                    log("precompute failed", repr(e))
         try:
             r, w = os.pipe()
             pid = os.fork()
@@ -757,6 +769,11 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
             try:
                 os.close(r)
                 runner.build_overlay(SRC, ov, c.patched, c.deleted)
+                if runner.PRE_ROWS is not None and any(
+                    ("_done", runner.TPC_SUB_OF_TEST.get(meta[t][3])) not in runner.PRE_ROWS
+                    for t in tests if meta[t][3] in runner.TPC_SUB_OF_TEST
+                ):
+                    runner.PRE_ROWS = None  # (not prepared: use the test's own setUpClass)
                 import zlib as _z
 
                 # deterministic shuffle of test classes: early results then represent the whole set

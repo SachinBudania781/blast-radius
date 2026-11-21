@@ -131,31 +131,30 @@ def _parse_rows(file_name):
     return rows
 
 
-def precompute_executor_rows(src):
+TPC_SUB_OF_TEST = {"test_execute_tpch": "tpc-h", "test_execute_tpcds": "tpc-ds"}
+
+
+def precompute_executor_rows(src, subs=("tpc-h", "tpc-ds")):
     """Parse the TPC-H/TPC-DS CSVs once in the parent, exactly like TestExecutor.setUpClass.
-    The image build stores the result for the pristine fixtures (BR_ROWS_CACHE)."""
+    Only the datasets of the given subs; only test_execute_tpch / test_execute_tpcds read them
+    (other executor tests get empty tables)."""
     global PRE_ROWS
     import importlib.util
 
-    cache = os.environ.get("BR_ROWS_CACHE")
-    if cache and os.path.exists(cache):
-        try:
-            import marshal
-
-            with open(cache, "rb") as f:
-                PRE_ROWS = marshal.load(f)
-            return
-        except Exception:
-            PRE_ROWS = None
-
+    if PRE_ROWS is None:
+        PRE_ROWS = {}
+    todo = [s for s in subs if ("_done", s) not in PRE_ROWS]
+    if not todo:
+        return
     spec = importlib.util.spec_from_file_location("_br_helpers", os.path.join(src, "tests", "helpers.py"))
     h = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(h)
-    pre = {}
     for sub, schema in (("tpc-h", h.TPCH_SCHEMA), ("tpc-ds", h.TPCDS_SCHEMA)):
+        if sub not in todo:
+            continue
         for table in schema:
-            pre[(sub, table)] = _parse_rows(os.path.join(src, "tests", "fixtures", "optimizer", sub, f"{table}.csv.gz"))
-    PRE_ROWS = pre
+            PRE_ROWS[(sub, table)] = _parse_rows(os.path.join(src, "tests", "fixtures", "optimizer", sub, f"{table}.csv.gz"))
+        PRE_ROWS[("_done", sub)] = True
 
 
 TPC_FILTER = None  # {"tpc-h": set(indices), "tpc-ds": set(indices)} of edited fixture queries
@@ -234,7 +233,7 @@ def _install_fast_executor_setup(mod, patched):
                 FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
                 """
             )
-            rows = list(PRE_ROWS[(sub, table)])
+            rows = list(PRE_ROWS.get((sub, table), ()))  # empty: this child runs no test reading it
             tables[table] = rows
             tables[table] = Table(columns=columns, rows=rows)
 
@@ -624,6 +623,9 @@ def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patc
         import gc
 
         gc.freeze()
+        thr = os.environ.get("BR_GC_THRESHOLD")
+        if thr:
+            gc.set_threshold(*[int(x) for x in thr.split(",")])
     for file, items in by_file.items():
         mod = imported.get(file)
         if mod is None:
