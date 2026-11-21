@@ -81,6 +81,10 @@ class Maps:
         sid = self.index["file_readers"].get(path)
         return self.set(sid) if sid is not None else set()
 
+    def direct_readers(self, path):
+        sid = self.index.get("file_direct", {}).get(path)
+        return self.set(sid) if sid is not None else set()
+
 
 # ---------------------------------------------------------------- change analysis
 _COMMENT = re.compile(rb"^[ \t\f]*(#.*)?$")
@@ -226,6 +230,7 @@ class Commit:
         self.sure = set()  # tests we include without running (expected to fail)
         self.import_check = set()  # python module relpaths to import first
         self.import_fail_sets = {}  # relpath -> tests failing if import fails
+        self.mod_sets = {}  # patched python relpath -> tests that import/use it
         self.unknown = False
         self.result = None
         self.notes = []
@@ -288,13 +293,23 @@ def analyze(cid, data, maps, ntests, all_tests):
             if old.endswith(".sql") and old.startswith("tests/fixtures/"):
                 if _sql_fixture_harmless(fp):
                     continue
-                # an edited fixture query nearly always breaks the tests reading it
-                c.sure |= rd
+                # an edited fixture query nearly always breaks the tests that load it themselves;
+                # tests that only see it through setUpClass are run to check
+                c.sure |= maps.direct_readers(old) & rd
                 c.fixture_readers = getattr(c, "fixture_readers", set()) | rd
+                for key in ("tpc-h", "tpc-ds"):
+                    if old == f"tests/fixtures/optimizer/{key}/{key}.sql":
+                        ch = _tpc_changed(original, patched)
+                        if ch is not None:
+                            c.tpc_filter = getattr(c, "tpc_filter", None) or {"tpc-h": set(), "tpc-ds": set()}
+                            c.tpc_filter[key] = ch
+                        else:
+                            c.tpc_filter_bad = True
             c.cands |= rd
             continue
         narrow, wide, rd, mu, sspans, bslash, fspans = info
         c.cands |= maps.set(rd)
+        c.mod_sets[old] = mu
         any_code = False
         defs_changed = False
         for removed, rtxt, added in patchutil.changes(fp):
@@ -321,6 +336,29 @@ def analyze(cid, data, maps, ntests, all_tests):
                 if DEBUG:
                     c.notes.append(f"import-check {old}")
     return c
+
+
+def _fixture_pairs(text):
+    """tests/helpers.py load_sql_fixture_pairs, on a string."""
+    s = "\n".join(line for line in text.splitlines() if line and not line.startswith("--"))
+    statements = s.split(";")
+    out = []
+    for i in range(0, len(statements), 2):
+        if i + 1 < len(statements):
+            out.append((statements[i].strip(), statements[i + 1].strip()))
+    return out
+
+
+def _tpc_changed(original, patched):
+    """Indices of edited query pairs, or None if the pairing shifted."""
+    try:
+        a = _fixture_pairs(original.decode("utf-8"))
+        b = _fixture_pairs(patched.decode("utf-8"))
+    except Exception:
+        return None
+    if len(a) != len(b):
+        return None
+    return {i for i, (x, y) in enumerate(zip(a, b)) if x != y}
 
 
 def _sql_fixture_harmless(fp):
@@ -387,6 +425,12 @@ def main():
         f, cls, name = t["id"].split("::")
         meta.append((t["number"], t["file"], cls, name))
     maps = Maps(ntests)
+    global _MAPS
+    _MAPS = maps
+    try:
+        os.makedirs(TMP, exist_ok=True)
+    except OSError:
+        pass
     cdir = os.path.join(DATA, "commits")
     ids = sorted(fn[:-6] for fn in os.listdir(cdir) if fn.endswith(".patch"))
     global DEADLINE
@@ -416,12 +460,28 @@ def main():
         c.sure = {t for t in c.sure if ms[t] < 3000}
         cand = c.cands - c.always - c.sure
         cheap = {t for t in cand if ms[t] < EXPENSIVE * 1000}
+        tf = getattr(c, "tpc_filter", None)
+        run_ms = {}
+        if tf and not getattr(c, "tpc_filter_bad", False) and not any(p.endswith(".py") for p in c.patched) and not c.deleted:
+            # executor tests only re-run the edited TPC queries: cheap to check
+            ex = {t for t in cand if meta[t][1] == "tests/test_executor.py"}
+            cheap |= ex
+            nq = sum(len(v) for v in tf.values())
+            for t in ex:
+                if meta[t][3] in ("test_execute_tpcds", "test_execute_tpch", "test_optimized_tpch"):
+                    run_ms[t] = ms[t] * min(1.0, (nq + 1) / 20.0)
+        else:
+            c.tpc_filter = None
         exp_ = cand - cheap
         c.cheap, c.exp = cheap, exp_
-        if cheap and policy.CPU_RATIO * sum(ms[t] for t in cheap) > policy.pack_cost(cheap | exp_ | c.sure | c.always, ms) and not c.import_check:
+        if cheap and policy.CPU_RATIO * sum(run_ms.get(t, ms[t]) for t in cheap) > policy.pack_cost(cheap | exp_ | c.sure | c.always, ms):
             # running them would cost more than just including them
-            c.result = cheap | exp_ | c.sure | c.always
-            continue
+            if not c.import_check:
+                c.result = cheap | exp_ | c.sure | c.always
+                continue
+            # but first make sure the patched modules import (else far more tests fail)
+            c.include_all_after_import = cheap | exp_
+            c.cheap, c.exp = set(), set()
         if not cheap and not exp_ and not c.import_check:
             c.result = set(c.always) | c.sure
             continue
@@ -430,12 +490,22 @@ def main():
     ids = [t["id"] for t in tests]
     for c in jobs:
         c.early_blind = policy.early_stop_ok(c.cheap, c.exp, ms, ids)
-    run_jobs(jobs, meta, ms, maps, ids)
+    try:
+        run_jobs(jobs, meta, ms, maps, ids)
+    except BaseException as e:  # noqa: BLE001
+        log("run_jobs failed:", repr(e))
+        for c in jobs:
+            if c.result is None:
+                c.result = set(c.cands) | set(c.sure) | set(c.always) | set(getattr(c, "blind", ()))
 
     out = sys.stdout
     for c in commits:
-        res = c.result if c.result is not None else set(c.cands) | c.always
-        workers = pack(sorted(res), ms)
+        res = c.result if c.result is not None else set(c.cands) | c.always | c.sure
+        res = {t for t in res if isinstance(t, int) and 0 <= t < ntests}
+        try:
+            workers = pack(sorted(res), ms)
+        except Exception:  # noqa: BLE001
+            workers = [sorted(res)] if res else []
         out.write(json.dumps({"commit": c.cid, "workers": workers}, separators=(",", ":")) + "\n")
     out.flush()
     if DEBUG:
@@ -444,7 +514,12 @@ def main():
     log(f"done {len(commits)} commits in {time.time() - t_start:.1f}s")
 
 
+_MAPS = None
+
+
 def run_jobs(jobs, meta, ms, maps, ids=None):
+    global _MAPS
+    _MAPS = maps
     if ids is None:
         ids = [f"{m[1]}::{m[2]}::{m[3]}" for m in meta]
     import runner
@@ -476,15 +551,24 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
         nonlocal seq
         seq += 1
         ov = os.path.join(TMP, f"w{seq}")
-        r, w = os.pipe()
-        pid = os.fork()
+        try:
+            r, w = os.pipe()
+            pid = os.fork()
+        except OSError:
+            # cannot fork (process limit): include what we could not check
+            c.failed |= set(tests)
+            if phase == 1:
+                c.blind = set(c.exp)
+            _finish(c, ms)
+            return False
         if pid == 0:
             try:
                 os.close(r)
                 runner.build_overlay(SRC, ov, c.patched, c.deleted)
                 tl = [meta[t] for t in sorted(tests, key=lambda t: (meta[t][1], meta[t][2]))]
                 tm = float(os.environ.get("BR_TIMEOUT_MULT", "5"))
-                timeouts = {t: max(5.0, ms[t] / 1000 * tm + 3) for t in tests}
+                timeouts = {t: min(45.0, max(5.0, ms[t] / 1000 * tm + 3)) for t in tests}
+                runner.TPC_FILTER = getattr(c, "tpc_filter", None)
                 runner.child_main(ov, tl, w, timeouts, 0, sorted(m for m in c.import_check if m.startswith("sqlglot/") or m.startswith("tests/")), set(c.patched) | set(c.deleted))
             except BaseException:
                 pass
@@ -494,9 +578,13 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
         budget = min(budget, max(5.0, DEADLINE - time.time()))
         running[r] = [pid, c, b"", time.time() + budget, tests, ov]
         c.cur_tests = set(tests)
+        return True
 
     queue = []
     for c in pending:
+        if getattr(c, "include_all_after_import", None) is not None:
+            queue.append((c, set(), 1))
+            continue
         if not c.cheap and not c.import_check:
             nxt = _next_phase(c, ms, ids)
             if nxt:
@@ -569,6 +657,9 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
 
 
 def _ingest(c, buf, tests, meta):
+    if not buf.strip() and c.import_check and not getattr(c, "early_stopped", False):
+        # the child died before reporting anything: assume the patched modules break imports
+        c.import_failed |= set(c.import_check)
     for line in buf.decode("utf-8", "replace").splitlines():
         parts = line.split(" ", 1)
         if len(parts) != 2:
@@ -590,9 +681,11 @@ def _ingest(c, buf, tests, meta):
     for t in tests:
         if t not in c.reported:
             c.failed.add(t)
-    for t in tests:
-        if meta[t][1] in c.file_fail:
-            c.failed.add(t)
+    if c.file_fail:
+        # "a test fails when its file cannot be imported": every test of that file fails
+        for t in range(len(meta)):
+            if meta[t][1] in c.file_fail:
+                c.failed.add(t)
 
 
 def _next_phase(c, ms, ids):
@@ -621,17 +714,27 @@ def _next_phase(c, ms, ids):
         regime = "narrow"
     c.regime = regime
     base |= c.failed & c.cheap
-    blind, verify = policy.decide(c.exp, base, regime, n_cheap, ms, ids)
+    fx = set(c.exp) & getattr(c, "fixture_readers", set())
+    blind, verify = policy.decide(set(c.exp) - fx, base, regime, n_cheap, ms, ids)
+    if fx:
+        # what cheap tests did says nothing about a test reading an edited data file
+        b2, v2 = policy.decide(fx, base | blind, "unknown", n_cheap, ms, ids)
+        blind |= b2
+        verify |= v2
     c.blind = blind
     return verify or None
 
 
 def _finish(c, ms):
     res = set(c.failed) | c.always | c.sure | getattr(c, "blind", set())
+    res |= getattr(c, "include_all_after_import", None) or set()
     for m in c.import_failed:
         res |= c.import_fail_sets.get(m, set())
-    for f in c.file_fail:
-        pass
+    if c.file_fail:
+        # a test file failed to import because of patched code: every test file importing
+        # a patched module fails the same way
+        for rel, mu in c.mod_sets.items():
+            res |= _MAPS.set(mu)
     c.result = res
 
 

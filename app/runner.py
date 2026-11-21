@@ -74,7 +74,12 @@ def build_overlay(src_root, dst_root, patched, deleted):
 def _write(path, data):
     with open(path, "wb") as f:
         f.write(data)
-    os.utime(path, (1, 1))
+    # .pyc files are validated by (mtime, size). Derive the mtime from the content so a
+    # cached .pyc can only ever match this exact source (never the original, never another patch).
+    import zlib
+
+    mt = 1_000_000_000 + (zlib.crc32(data) & 0x3FFFFFFF)
+    os.utime(path, (mt, mt))
 
 
 PRE_ROWS = None
@@ -119,11 +124,16 @@ def precompute_executor_rows(src):
     PRE_ROWS = pre
 
 
+TPC_FILTER = None  # {"tpc-h": set(indices), "tpc-ds": set(indices)} of edited fixture queries
+
+
 def _install_fast_executor_setup(mod, patched):
     if PRE_ROWS is None:
         return
     for rel in patched:
-        if rel in ("tests/test_executor.py", "tests/helpers.py") or rel.startswith("tests/fixtures/optimizer/tpc-"):
+        if rel in ("tests/test_executor.py", "tests/helpers.py"):
+            return
+        if rel.startswith("tests/fixtures/optimizer/tpc-") and not rel.endswith(".sql"):
             return
     klass = getattr(mod, "TestExecutor", None)
     if klass is None:
@@ -185,12 +195,24 @@ def _install_fast_executor_setup(mod, patched):
         cls.cache = {}
         cls.tpch_sqls = list(mod.load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
         cls.tpcds_sqls = list(mod.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+        if TPC_FILTER is not None:
+            # only edited queries can change the outcome (sqlglot code is unchanged)
+            if "tpc-h" in TPC_FILTER:
+                cls.tpch_sqls = [p for i, p in enumerate(cls.tpch_sqls) if i in TPC_FILTER["tpc-h"]]
+            if "tpc-ds" in TPC_FILTER:
+                cls.tpcds_sqls = [p for i, p in enumerate(cls.tpcds_sqls) if i in TPC_FILTER["tpc-ds"]]
 
     klass.setUpClass = classmethod(setUpClass)
 
 
 def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patched=()):
     """tests: list of (number, file, cls, name). Runs in the forked child."""
+    # if memory runs out, the kernel should kill this child, never the parent
+    try:
+        with open("/proc/self/oom_score_adj", "w") as f:
+            f.write("1000")
+    except Exception:
+        pass
     # never let a test write to the real stdout (it would corrupt the answer stream)
     try:
         dn = os.open(os.devnull, os.O_RDWR)
@@ -223,6 +245,7 @@ def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patc
     sys.dont_write_bytecode = True
     os.environ["SKIP_INTEGRATION"] = "0"
     os.environ["PYTHONPATH"] = overlay
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     for k in list(sys.modules):
         if k == "sqlglot" or k.startswith("sqlglot.") or k == "tests" or k.startswith("tests."):
             del sys.modules[k]

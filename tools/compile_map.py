@@ -52,7 +52,17 @@ for tid, r in res.items():
     for fl in r["setup_lines"]:
         cov.setdefault(fl, set()).update(bycls[tid.rsplit("::", 1)[0]])
     tcls[n] = r["classes"]
-    tfiles[n] = r["files"]
+    tfiles[n] = set(r["files"])
+# files read while setUpClass ran (in the setup phase of the class's first test) belong to
+# every test of the class; we did not record phases for files, so propagate that test's files.
+# Those propagated reads are "indirect": the selector runs such tests instead of assuming they fail.
+direct_files = {n: set(fs) for n, fs in tfiles.items()}
+for tid, r in res.items():
+    if tid in ID and r["setup_lines"]:
+        for m in bycls[tid.rsplit("::", 1)[0]]:
+            tfiles.setdefault(m, set()).update(r["files"])
+            direct_files.setdefault(m, set()).difference_update(r["files"]) if m != ID[tid] else None
+        direct_files[ID[tid]] = set()  # the class's first test: cannot tell setup from call reads
 missing = set(range(NT)) - set(tcls)
 if missing:
     print("WARNING tests without trace:", len(missing), file=sys.stderr)
@@ -421,6 +431,11 @@ for rel, a in infos.items():
 
 # non-python files and directories read by tests
 file_readers = {p: sid(s) for p, s in readers.items() if not p.endswith(".py")}
+direct = {}
+for n, fs in direct_files.items():
+    for p in fs:
+        direct.setdefault(p, set()).add(n)
+file_direct = {p: sid(s) for p, s in direct.items() if not p.endswith(".py")}
 dir_listers = file_readers  # same table: directories appear as paths too
 
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
@@ -458,7 +473,7 @@ for st in sets:
 with open(os.path.join(outdir, "sets.bin"), "wb") as fh:
     fh.write(bytes(blobs))
 with open(os.path.join(outdir, "index.m"), "wb") as fh:
-    marshal.dump({"files": index, "file_readers": file_readers, "ntests": NT}, fh)
+    marshal.dump({"files": index, "file_readers": file_readers, "file_direct": file_direct, "ntests": NT}, fh)
 print("files", len(files_out), "sets", len(sets), file=sys.stderr)
 sz = sum(os.path.getsize(p) for p in glob.glob(os.path.join(outdir, "*.m")))
 print("bytes", sz, file=sys.stderr)
