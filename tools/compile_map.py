@@ -107,7 +107,87 @@ for qn, s in uses_class.items():
 ALL = frozenset(range(NT))
 
 
+# static module-level import graph (sqlglot.* and tests.*), skipping TYPE_CHECKING blocks
+def _static_imports(rel):
+    try:
+        tree = ast.parse(open(os.path.join(SRC, rel), encoding="utf-8").read())
+    except Exception:
+        return set()
+    me = modname(rel)
+    pkg = me if rel.endswith("__init__.py") else me.rsplit(".", 1)[0]
+    out = set()
+
+    def walk(body):
+        for st in body:
+            if isinstance(st, ast.If):
+                t = st.test
+                tc = (isinstance(t, ast.Name) and t.id == "TYPE_CHECKING") or (
+                    isinstance(t, ast.Attribute) and t.attr == "TYPE_CHECKING"
+                )
+                if not tc:
+                    walk(st.body)
+                walk(st.orelse)
+            elif isinstance(st, (ast.Try,)):
+                walk(st.body)
+                for h in st.handlers:
+                    walk(h.body)
+                walk(st.orelse)
+                walk(st.finalbody)
+            elif isinstance(st, ast.Import):
+                for a in st.names:
+                    out.add(a.name)
+            elif isinstance(st, ast.ImportFrom):
+                base = st.module or ""
+                if st.level:
+                    parts = pkg.split(".")
+                    parts = parts[: len(parts) - (st.level - 1)] if st.level > 1 else parts
+                    base = ".".join(parts + ([base] if base else []))
+                out.add(base)
+                for a in st.names:
+                    out.add(f"{base}.{a.name}")
+
+    walk(tree.body)
+    res = set()
+    for m in out:
+        # every package prefix gets imported too
+        parts = m.split(".")
+        for i in range(1, len(parts) + 1):
+            res.add(".".join(parts[:i]))
+    return {m for m in res if m != me}
+
+
+_all_py = sorted(
+    p[len(SRC) + 1 :]
+    for p in glob.glob(SRC + "/sqlglot/**/*.py", recursive=True) + glob.glob(SRC + "/tests/**/*.py", recursive=True)
+)
+_mod_to_rel = {modname(r): r for r in _all_py}
+_importers = {}
+for r in _all_py:
+    for m in _static_imports(r):
+        if m in _mod_to_rel:
+            _importers.setdefault(_mod_to_rel[m], set()).add(r)
+
+
+def rev_import_closure(rel):
+    seen = {rel}
+    stack = [rel]
+    while stack:
+        x = stack.pop()
+        for y in _importers.get(x, ()):
+            if y not in seen:
+                seen.add(y)
+                stack.append(y)
+    return seen
+
+
 def moduse(rel):
+    out = set()
+    for r in rev_import_closure(rel):
+        out |= _moduse_one(r)
+    return out
+
+
+def _moduse_one(rel):
     m = modname(rel)
     s = set(lines_by_file.get(rel, ()))
     s |= cls_by_module.get(m, set())

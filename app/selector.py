@@ -569,7 +569,7 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
                 runner.build_overlay(SRC, ov, c.patched, c.deleted)
                 tl = [meta[t] for t in sorted(tests, key=lambda t: (meta[t][1], meta[t][2]))]
                 tm = float(os.environ.get("BR_TIMEOUT_MULT", "5"))
-                timeouts = {t: min(45.0, max(5.0, ms[t] / 1000 * tm + 3)) for t in tests}
+                timeouts = {t: min(float(os.environ.get("BR_TIMEOUT_CAP", "45")), max(5.0, ms[t] / 1000 * tm + 3)) for t in tests}
                 runner.TPC_FILTER = getattr(c, "tpc_filter", None)
                 runner.child_main(ov, tl, w, timeouts, 0, sorted(m for m in c.import_check if m.startswith("sqlglot/") or m.startswith("tests/")), set(c.patched) | set(c.deleted))
             except BaseException:
