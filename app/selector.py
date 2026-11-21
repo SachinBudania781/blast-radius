@@ -250,7 +250,15 @@ def analyze(cid, data, maps, ntests, all_tests):
         return c
     for fp in fps:
         if fp.binary:
-            c.unknown = True
+            # cannot apply binary deltas: a binary file matters only to tests that read it
+            path = fp.new_path or fp.old_path
+            if path and path.endswith(".py"):
+                c.unknown = True
+            elif path:
+                rd = maps.readers(path) | maps.readers(fp.old_path or path)
+                c.always |= rd
+            else:
+                c.unknown = True
             continue
         old = fp.old_path
         new = fp.new_path
