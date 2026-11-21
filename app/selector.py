@@ -1168,15 +1168,21 @@ def _slack_stop(c, buf, ms, ids):
         return False
     import copy
 
-    d = copy.copy(c)
-    d.cheap, d.failed, d.reported = set(rep), set(bad) | (c.failed & c.cheap - rest), set(c.reported) | rep
-    d.phase, d.early_stopped, d.early_cat, d.slack_R = 1, False, False, None
-    d.deferred = None
+    def decide_on(cheap_set):
+        d = copy.copy(c)
+        d.cheap, d.failed, d.reported = set(cheap_set), set(bad), set(c.reported) | rep | (cheap_set - rep)
+        d.phase, d.early_stopped, d.early_cat, d.slack_R = 1, False, False, None
+        d.deferred = None
+        _next_phase(d, ms, ids)
+        return d
+
     try:
-        verify = _next_phase(d, ms, ids) or set()
+        d = decide_on(rep)  # on what ran so far
+        d_all = decide_on(set(c.cheap))  # and if every test still to run passes
     except Exception:  # noqa: BLE001
         return False
-    blind = set(getattr(d, "blind", set()) or set())
+    # only what goes in unverified either way (failures cluster by file, so early odds run high)
+    blind = set(getattr(d, "blind", set()) or set()) & set(getattr(d_all, "blind", set()) or set())
     if not blind or getattr(d, "regime", None) == "dead":
         return False
     base = set(d.failed) | blind | c.always | c.sure | set(getattr(d, "deferred", None) or ())
