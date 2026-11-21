@@ -35,7 +35,9 @@ PAR = int(os.environ.get("BR_PAR", "2"))
 DEBUG = os.environ.get("BR_DEBUG") == "1"
 VERIFY_ALL = os.environ.get("BR_VERIFY_ALL") == "1"
 DIAG = os.environ.get("BR_DIAG") == "1"
-PDIAG = os.environ.get("BR_PDIAG") == "1"  # measurement build: why was a passing TPC-DS run added  # measurement build: encode where unverified tests were wasted  # measurement mode (never include unverified, except catastrophic)
+PDIAG = os.environ.get("BR_PDIAG") == "1"  # measurement build: why was a passing TPC-DS run added
+CDIAG = os.environ.get("BR_CDIAG") == "1"  # measurement build: where the CPU goes
+CPU_BY_PHASE = {}  # measurement build: encode where unverified tests were wasted  # measurement mode (never include unverified, except catastrophic)
 
 # tests with a cheap stand-in in runner.PROBES
 PROBE_IDS = ("tests/test_generator.py::TestGenerator::test_generator_memory", "tests/test_parser.py::TestParser::test_max_nodes")
@@ -730,6 +732,11 @@ def main():
             _pdiag(outs, tests, meta, ms, maps, ids)
         except Exception as e:  # noqa: BLE001
             log("pdiag failed", repr(e))
+    if CDIAG:
+        try:
+            _cdiag(outs, tests)
+        except Exception as e:  # noqa: BLE001
+            log("cdiag failed", repr(e))
     out = sys.stdout
     for c, res, workers in outs:
         out.write(json.dumps({"commit": c.cid, "workers": workers}, separators=(",", ":")) + "\n")
@@ -803,6 +810,38 @@ def _diag(outs, tests, meta, ms, maps, ids):
         if cand:
             o[2].append([cand[0]])
     zeros = n_x + 20 * n_c
+    for o in outs:
+        if zeros <= 0:
+            break
+        used = {x for w in o[2] for x in w}
+        for x in pool.get(0.0, []):
+            if zeros <= 0 or len(o[2]) >= 8:
+                break
+            if x in o[1] or x in used:
+                continue
+            o[2].append([x])
+            used.add(x)
+            zeros -= 1
+
+
+def _cdiag(outs, tests):
+    """Measurement build: encode CPU by phase as extra 0-second workers (+2 s each):
+    N = round(phase-2 CPU / 2) + 11 * round(phase-1 CPU / 2); and on empty commits one 0.001
+    worker per parent CPU second (<= 9)."""
+    p1 = min(int(round(CPU_BY_PHASE.get(1, 0.0) / 2)), 19)
+    p2 = min(int(round(CPU_BY_PHASE.get(2, 0.0) / 2)), 10)
+    tm = os.times()
+    par = min(int(round(tm.user + tm.system)), 9)
+    log(f"cdiag phase1={CPU_BY_PHASE.get(1, 0.0):.1f} phase2={CPU_BY_PHASE.get(2, 0.0):.1f} parent={tm.user + tm.system:.1f} -> {p1} {p2} {par}")
+    pool = {}
+    for t in tests:
+        pool.setdefault(t["seconds"], []).append(t["number"])
+    empties = [o for o in outs if not o[2]]
+    for o in empties[:par]:
+        cand = [x for x in pool.get(0.001, []) if x not in o[1]]
+        if cand:
+            o[2].append([cand[0]])
+    zeros = p2 + 11 * p1
     for o in outs:
         if zeros <= 0:
             break
@@ -1079,6 +1118,7 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
                 try:
                     _, _, ru = os.wait4(pid, 0)
                     c.cpu = getattr(c, "cpu", 0.0) + ru.ru_utime + ru.ru_stime
+                    CPU_BY_PHASE[c.phase] = CPU_BY_PHASE.get(c.phase, 0.0) + ru.ru_utime + ru.ru_stime
                     if DEBUG:
                         log(f"job {c.cid} phase{c.phase} tests={len(tests)} rec={sum(ms[t] for t in tests)/1000:.2f}s cpu={ru.ru_utime + ru.ru_stime:.2f}s")
                 except OSError:
