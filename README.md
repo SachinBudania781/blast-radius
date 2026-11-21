@@ -51,7 +51,14 @@ packed onto the cheapest number of workers.
    text gets that stored answer and any other text still runs DuckDB (test_execute_tpcds
    33 s -> 12.7 s CPU, test_optimized_tpch 4.5 s -> 0.2 s).
    Imported objects are frozen out of the cyclic GC (parent before forking, child after
-   importing the test modules), which cuts collection work during tests.
+   importing the test modules), which cuts collection work during tests; the GC is off while
+   the TPC executor tests run (millions of short-lived row tuples).
+   Costs: our measured CPU is priced at 1.25x (a diagnostic build re-ran `test_execute_tpcds`
+   on the scoring machine: ~15 s vs ~12 s here).
+   Stopping on slack: while the cheap tests run, every ~25 results the expensive tests are
+   decided on what has run so far (and again assuming the rest pass); if some go in unverified
+   either way and the cheap tests still to run fit beside them for less than half the CPU of
+   running them, the child is stopped and those tests are included unrun.
 4. Output: the failing tests, packed by LPT over 1..8 workers to minimise
    busiest worker + 2 s per worker.
 
