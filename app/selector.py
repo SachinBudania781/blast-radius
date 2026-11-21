@@ -413,7 +413,7 @@ def main():
         if c.unknown:
             c.result = set(all_tests)
             continue
-        c.sure = {t for t in c.sure if ms[t] < EXPENSIVE * 1000}
+        c.sure = {t for t in c.sure if ms[t] < 3000}
         cand = c.cands - c.always - c.sure
         cheap = {t for t in cand if ms[t] < EXPENSIVE * 1000}
         exp_ = cand - cheap
@@ -483,13 +483,14 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
                 os.close(r)
                 runner.build_overlay(SRC, ov, c.patched, c.deleted)
                 tl = [meta[t] for t in sorted(tests, key=lambda t: (meta[t][1], meta[t][2]))]
-                timeouts = {t: max(3.0, ms[t] / 1000 * 3 + 2) for t in tests}
+                tm = float(os.environ.get("BR_TIMEOUT_MULT", "5"))
+                timeouts = {t: max(5.0, ms[t] / 1000 * tm + 3) for t in tests}
                 runner.child_main(ov, tl, w, timeouts, 0, sorted(m for m in c.import_check if m.startswith("sqlglot/") or m.startswith("tests/")), set(c.patched) | set(c.deleted))
             except BaseException:
                 pass
             os._exit(0)
         os.close(w)
-        budget = 15.0 + sum(ms[t] for t in tests) / 1000 * 3
+        budget = 15.0 + sum(ms[t] for t in tests) / 1000 * float(os.environ.get("BR_TIMEOUT_MULT", "5"))
         budget = min(budget, max(5.0, DEADLINE - time.time()))
         running[r] = [pid, c, b"", time.time() + budget, tests, ov]
         c.cur_tests = set(tests)
@@ -601,19 +602,26 @@ def _next_phase(c, ms, ids):
     if c.import_failed:
         return None
     base = set(c.always) | set(c.sure)
+    n_cheap = len(c.cheap)
     if getattr(c, "early_stopped", False):
         # everything cheap goes in unverified, next to the big blind test(s)
         c.blind = set(c.cheap) | set(c.early_blind)
         rest = set(c.exp) - c.blind
-        blind, verify = policy.decide(rest, base | c.blind, True, ms, ids)
+        blind, verify = policy.decide(rest, base | c.blind, "broad", n_cheap, ms, ids)
         c.blind |= blind
         return verify or None
+    nf = len(c.failed & c.cheap)
     if not c.cheap:
-        live = True  # nothing cheap to learn from: be conservative
+        regime = "unknown"
+    elif nf == 0:
+        regime = "dead"
+    elif nf * 2 >= n_cheap:
+        regime = "broad"
     else:
-        live = bool(c.failed & c.cheap)
+        regime = "narrow"
+    c.regime = regime
     base |= c.failed & c.cheap
-    blind, verify = policy.decide(c.exp, base, live, ms, ids)
+    blind, verify = policy.decide(c.exp, base, regime, n_cheap, ms, ids)
     c.blind = blind
     return verify or None
 
