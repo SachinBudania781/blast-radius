@@ -299,6 +299,34 @@ def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patc
             out.flush()
             os._exit(0)
 
+    # class bodies elsewhere run sqlglot code at import time (e.g. generators parse SQL
+    # templates), so a definition change can break importing *another* module: import every
+    # dialect module too and report the ones that fail
+    if import_mods:
+        try:
+            names = list(sys.modules["sqlglot.dialects"].DIALECT_MODULE_NAMES) if "sqlglot.dialects" in sys.modules else []
+        except Exception:
+            names = []
+        if not names:
+            try:
+                import sqlglot.dialects as _d
+
+                names = list(_d.DIALECT_MODULE_NAMES)
+            except Exception:
+                names = []
+        broken = False
+        for name in names:
+            try:
+                signal.setitimer(signal.ITIMER_REAL, float(os.environ.get("BR_IMPORT_TIMEOUT", "60")))
+                __import__(f"sqlglot.dialects.{name}")
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            except BaseException:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                out.write(f"-2 sqlglot/dialects/{name}.py\n")
+                broken = True
+        if broken:
+            out.flush()
+            os._exit(0)
     # imports of the patched modules are fine
     out.write("-3 ready\n")
     out.flush()

@@ -231,6 +231,8 @@ class Commit:
         self.import_check = set()  # python module relpaths to import first
         self.import_fail_sets = {}  # relpath -> tests failing if import fails
         self.mod_sets = {}  # patched python relpath -> tests that import/use it
+        self.line_changes = []  # (relpath, old line numbers, structural)
+        self.dedicated = set()  # expensive tests dedicated to a changed file
         self.unknown = False
         self.result = None
         self.notes = []
@@ -307,7 +309,7 @@ def analyze(cid, data, maps, ntests, all_tests):
                             c.tpc_filter_bad = True
             c.cands |= rd
             continue
-        narrow, wide, rd, mu, sspans, bslash, fspans = info
+        narrow, wide, rd, mu, sspans, bslash, fspans = info[:7]
         c.cands |= maps.set(rd)
         c.mod_sets[old] = mu
         any_code = False
@@ -316,18 +318,22 @@ def analyze(cid, data, maps, ntests, all_tests):
             if hunk_is_comment_only(removed, rtxt, added, sspans, set(bslash)):
                 continue
             any_code = True
-            table = wide if is_structural(rtxt, added) else narrow
+            structural = is_structural(rtxt, added)
+            table = wide if structural else narrow
             lines = list(removed)
             if not removed:
                 lines = [p - 1 for p, _ in added] + [p for p, _ in added]
             elif len(added) > len(removed):
                 lines += [p for p, _ in added]
+            c.line_changes.append((old, list(lines), structural))
             for ln in lines:
                 if 0 < ln < len(table):
                     c.cands |= maps.set(table[ln])
                 elif ln >= len(table) and len(table) > 1:
                     c.cands |= maps.set(table[len(table) - 1])
         if any_code:
+            if len(info) > 7:
+                c.dedicated |= set(info[7])
             # syntax / import-time safety
             ok = local_syntax_ok(patched, fp, fspans)
             if ok is not True:
@@ -359,6 +365,62 @@ def _tpc_changed(original, patched):
     if len(a) != len(b):
         return None
     return {i for i, (x, y) in enumerate(zip(a, b)) if x != y}
+
+
+_TPCQ = None
+TPC_TESTS = {"test_execute_tpch": "tpc-h", "test_optimized_tpch": "tpc-h", "test_execute_tpcds": "tpc-ds"}
+
+
+def _tpcq():
+    global _TPCQ
+    if _TPCQ is None:
+        try:
+            _TPCQ = marshal.load(open(os.path.join(MAPS, "tpcq.m"), "rb"))
+        except Exception:
+            _TPCQ = {}
+    return _TPCQ
+
+
+def tpc_query_filter(c, maps, meta):
+    """For a code-only change, which TPC queries can change outcome. Returns
+    ({list_key: set(indices)}, {test: fraction_of_cost}) or (None, None)."""
+    if not c.line_changes or c.deleted:
+        return None, None
+    for p in c.patched:
+        if not p.endswith(".py") or p in ("tests/test_executor.py", "tests/helpers.py") or not p.startswith("sqlglot/"):
+            return None, None
+    tq = _tpcq()
+    lists = {}
+    frac = {}
+    for x in c.cands:
+        if meta[x][1] != "tests/test_executor.py" or meta[x][3] not in TPC_TESTS or x not in tq:
+            continue
+        weights, idx = tq[x]
+        allmask = (1 << len(weights)) - 1
+        m = 0
+        for rel, lines, structural in c.line_changes:
+            if structural:
+                m = allmask
+                break
+            fidx = idx.get(rel, {})
+            info = maps.file(rel)
+            for ln in lines:
+                if ln in fidx:
+                    m |= fidx[ln]
+                elif info is not None and 0 < ln < len(info[0]) and x in maps.set(info[0][ln]):
+                    m = allmask  # candidate through a non-query line (setup, class attribute, ...)
+                    break
+            if m == allmask:
+                break
+        if m == 0:
+            m = allmask  # no query line touched: be safe and run them all
+        sel = {i for i in range(len(weights)) if m >> i & 1}
+        key = TPC_TESTS[meta[x][3]]
+        lists.setdefault(key, set()).update(sel)
+        frac[x] = sum(weights[i] for i in sel)
+    if not lists:
+        return None, None
+    return lists, frac
 
 
 def _sql_fixture_harmless(fp):
@@ -472,8 +534,17 @@ def main():
                     run_ms[t] = ms[t] * min(1.0, (nq + 1) / 20.0)
         else:
             c.tpc_filter = None
+            lists, frac = tpc_query_filter(c, maps, meta)
+            if lists is not None:
+                c.tpc_filter = {k: v for k, v in lists.items()}
+                for x, f in frac.items():
+                    run_ms[x] = ms[x] * f + 150
+                    if run_ms[x] < 500:
+                        cheap.add(x)
+                c.run_ms = run_ms
         exp_ = cand - cheap
         c.cheap, c.exp = cheap, exp_
+        c.run_ms = run_ms
         if cheap and policy.CPU_RATIO * sum(run_ms.get(t, ms[t]) for t in cheap) > policy.pack_cost(cheap | exp_ | c.sure | c.always, ms):
             # running them would cost more than just including them
             if not c.import_check:
@@ -489,7 +560,7 @@ def main():
 
     ids = [t["id"] for t in tests]
     for c in jobs:
-        c.early_blind = policy.early_stop_ok(c.cheap, c.exp, ms, ids)
+        c.early_blind = policy.early_stop_ok(c.cheap, c.exp, ms, ids, getattr(c, "run_ms", None), c.dedicated)
     try:
         run_jobs(jobs, meta, ms, maps, ids)
     except BaseException as e:  # noqa: BLE001
@@ -712,7 +783,7 @@ def _next_phase(c, ms, ids):
         # everything cheap goes in unverified, next to the big blind test(s)
         c.blind = set(c.cheap) | set(c.early_blind)
         rest = set(c.exp) - c.blind
-        blind, verify = policy.decide(rest, base | c.blind, "broad", n_cheap, ms, ids)
+        blind, verify = policy.decide(rest, base | c.blind, "cat", n_cheap, ms, ids, getattr(c, "run_ms", None), c.dedicated)
         c.blind |= blind
         return verify or None
     nf = len(c.failed & c.cheap)
@@ -720,17 +791,19 @@ def _next_phase(c, ms, ids):
         regime = "unknown"
     elif nf == 0:
         regime = "dead"
-    elif nf * 2 >= n_cheap:
+    elif nf >= 0.8 * n_cheap and n_cheap >= 3:
+        regime = "cat"
+    elif nf >= 0.3 * n_cheap:
         regime = "broad"
     else:
         regime = "narrow"
     c.regime = regime
     base |= c.failed & c.cheap
     fx = set(c.exp) & getattr(c, "fixture_readers", set())
-    blind, verify = policy.decide(set(c.exp) - fx, base, regime, n_cheap, ms, ids)
+    blind, verify = policy.decide(set(c.exp) - fx, base, regime, n_cheap, ms, ids, getattr(c, "run_ms", None), c.dedicated)
     if fx:
         # what cheap tests did says nothing about a test reading an edited data file
-        b2, v2 = policy.decide(fx, base | blind, "unknown", n_cheap, ms, ids)
+        b2, v2 = policy.decide(fx, base | blind, "unknown", n_cheap, ms, ids, getattr(c, "run_ms", None), c.dedicated)
         blind |= b2
         verify |= v2
     c.blind = blind
@@ -741,7 +814,14 @@ def _finish(c, ms):
     res = set(c.failed) | c.always | c.sure | getattr(c, "blind", set())
     res |= getattr(c, "include_all_after_import", None) or set()
     for m in c.import_failed:
-        res |= c.import_fail_sets.get(m, set())
+        if m in c.import_fail_sets:
+            res |= c.import_fail_sets[m]
+        else:
+            info = _MAPS.file(m) if _MAPS is not None else None
+            if info is not None:
+                res |= _MAPS.set(info[3])  # every test that imports/uses that module
+        for rel, mu in c.mod_sets.items():
+            res |= _MAPS.set(mu)
     if c.file_fail:
         # a test file failed to import because of patched code: every test file importing
         # a patched module fails the same way

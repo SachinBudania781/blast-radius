@@ -371,6 +371,10 @@ def attr_runtime_readers(nm, fam_quals=()):
     return _attr_cache[key]
 
 
+SEC_MS = [round(t["seconds"] * 1000) for t in T]
+file_lines = {}
+for (f, x) in cov:
+    file_lines.setdefault(f, set()).add((f, x))
 files_out = {}
 for rel, a in infos.items():
     nl = a["nlines"]
@@ -499,6 +503,16 @@ for rel, a in infos.items():
                 first = src_lines[sc.start - 1]
                 indent = len(first) - len(first.lstrip())
                 fspans.append((sc.start, sc.end, indent))
+    # expensive tests "dedicated" to this file: they execute >= 40% of its covered lines
+    covered = [x for (f, x) in file_lines.get(rel, ())]
+    dedicated = ()
+    if covered:
+        cnt = {}
+        for x in covered:
+            for t in cov.get((rel, x), ()):
+                if SEC_MS[t] >= 1000:
+                    cnt[t] = cnt.get(t, 0) + 1
+        dedicated = tuple(sorted(t for t, k in cnt.items() if k >= 0.4 * len(covered)))
     files_out[rel] = (
         narrow,
         wide,
@@ -507,6 +521,7 @@ for rel, a in infos.items():
         tuple(sorted(a["string_spans"])),
         tuple(sorted(a["backslash_lines"])),
         tuple(sorted(fspans)),
+        dedicated,
     )
 
 # non-python files and directories read by tests
@@ -541,7 +556,7 @@ for i, (k, v) in enumerate(sorted(files_out.items())):
     fn = f"f_{i:03d}.m"
     index[k] = fn
     with open(os.path.join(outdir, fn), "wb") as fh:
-        marshal.dump((bytes(_pack(v[0])), bytes(_pack(v[1])), v[2], v[3], v[4], v[5], v[6]), fh)
+        marshal.dump((bytes(_pack(v[0])), bytes(_pack(v[1])), v[2], v[3], v[4], v[5], v[6], v[7]), fh)
 # sets as fixed-width bitsets (one bytes blob), decoded lazily by the selector
 nb = (NT + 7) // 8
 blobs = bytearray()

@@ -51,6 +51,12 @@ for f in glob.glob("/home/claude/brmap2/map-gw*.pkl"):
 
 if TARGET == "expensive":
     targets = [i for i in range(len(tests)) if ms[i] >= 1000]
+elif TARGET == "big":
+    targets = [i for i in range(len(tests)) if ms[i] >= 6000]
+elif TARGET == "executor":
+    targets = [i for i in range(len(tests)) if tests[i]["id"].endswith("::test_execute_tpcds")]
+    for k in list(cov_by_test):
+        cov_by_test[k] = [fl for fl in cov_by_test[k] if fl[0].startswith("sqlglot/executor/") or fl[0] == "sqlglot/planner.py"]
 else:
     targets = list(range(len(tests)))
 
