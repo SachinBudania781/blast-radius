@@ -520,6 +520,10 @@ _MAPS = None
 def run_jobs(jobs, meta, ms, maps, ids=None):
     global _MAPS
     _MAPS = maps
+    try:
+        os.makedirs(TMP, exist_ok=True)
+    except OSError:
+        pass
     if ids is None:
         ids = [f"{m[1]}::{m[2]}::{m[3]}" for m in meta]
     import runner
@@ -573,7 +577,11 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
                 runner.TPC_FILTER = getattr(c, "tpc_filter", None)
                 runner.child_main(ov, tl, w, timeouts, 0, sorted(m for m in c.import_check if m.startswith("sqlglot/") or m.startswith("tests/")), set(c.patched) | set(c.deleted))
             except BaseException:
-                pass
+                if os.environ.get("BR_CHILD_DEBUG"):
+                    import traceback
+
+                    with open(os.environ["BR_CHILD_DEBUG"], "a") as fh:
+                        fh.write(traceback.format_exc())
             os._exit(0)
         os.close(w)
         budget = 15.0 + sum(ms[t] for t in tests) / 1000 * float(os.environ.get("BR_TIMEOUT_MULT", "5"))
@@ -623,7 +631,7 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
                 if chunk:
                     buf += chunk
                     running[fd][2] = buf
-                    if c.phase == 1 and getattr(c, "early_blind", None) and (b" 1\n" in buf or buf.startswith(b"-")):
+                    if c.phase == 1 and getattr(c, "early_blind", None) and (b" 1\n" in buf.replace(b"-3 ready\n", b"") or b"-1 " in buf or b"-2 " in buf):
                         # live change and a big test goes on its own worker anyway: stop here
                         c.early_stopped = True
                         try:
@@ -659,8 +667,8 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
 
 
 def _ingest(c, buf, tests, meta):
-    if not buf.strip() and c.import_check and not getattr(c, "early_stopped", False):
-        # the child died before reporting anything: assume the patched modules break imports
+    if b"-3 ready" not in buf and b"-2 " not in buf and c.import_check and not getattr(c, "early_stopped", False):
+        # the child died before its import checks finished: assume the patched modules break imports
         c.import_failed |= set(c.import_check)
     for line in buf.decode("utf-8", "replace").splitlines():
         parts = line.split(" ", 1)
@@ -671,6 +679,8 @@ def _ingest(c, buf, tests, meta):
             continue
         if parts[0] == "-2":
             c.import_failed.add(parts[1])
+            continue
+        if parts[0] == "-3":
             continue
         try:
             n = int(parts[0])

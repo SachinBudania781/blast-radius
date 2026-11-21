@@ -276,6 +276,10 @@ def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patc
             out.flush()
             os._exit(0)
 
+    # imports of the patched modules are fine
+    out.write("-3 ready\n")
+    out.flush()
+
     # group by file then class, keeping order
     by_file = {}
     for num, file, cls, name in tests:
