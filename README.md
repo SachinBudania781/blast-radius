@@ -29,17 +29,24 @@ packed onto the cheapest number of workers.
    all needed test modules (like pytest collection) and runs the candidate tests with
    `unittest`. Every test reported failed, or never reported, is included; a test file that
    cannot be imported fails all of its tests and every file importing the patched module.
-3. Expensive tests (>= 1 s) are decided by expected cost (run it, include it unrun, or leave
-   it out), using how many cheap candidates failed (catastrophic / broad / narrow / none) and,
+3. "Cheap" means under 1 s recorded *or* under 1 s of our own CPU (`maps/cpu.m`, measured
+   at the pinned commit: some tests are slow in the recorded run only because of a process
+   pool or class setup, e.g. `test_execute_tpch` 3.9 s recorded, 0.2 s for us). Expensive
+   tests are decided by expected cost (run it, include it unrun, or leave it out) using
+   measured CPU, how many cheap candidates failed (catastrophic / broad / narrow / none) and,
    in the narrow case, whether cheap tests of the expensive test's own class failed.
    Probabilities come from clean synthetic single-line mutants of the pinned commit
    (`tools/campaign.py`, `tools/validate.py`). A change that breaks almost everything stops
    early and includes all candidates.
-   The two slowest tests have cheap stand-ins that run their own checks in the child:
-   `test_generator_memory` (same loop and leak threshold, with pre-existing objects frozen out
-   of the cyclic GC so its `gc.collect()` calls are cheap) and `test_max_nodes` (the same
-   node-limit checks at 1/100 scale). A failed stand-in includes the test; a passed one leaves
-   it out. They are not used when the test's own file is edited.
+   Proxies: for changes outside executor-side code, `test_execute_tpch` and the optimizer's
+   `test_tpch` / `test_tpcds` (same queries, much cheaper) decide the TPC executor tests;
+   early stopping at the first failure is only used when a big test would be added even on
+   the best evidence, or once one of those cheap TPC tests (run first) fails.
+   The slowest test has a cheap stand-in that runs its own checks in the child:
+   `test_max_nodes` (the same node-limit checks at 1/100 scale). A failed stand-in includes the
+   test; a passed one leaves it out. Not used when the test's own file is edited.
+   Imported objects are frozen out of the cyclic GC (parent before forking, child after
+   importing the test modules), which cuts collection work during tests.
 4. Output: the failing tests, packed by LPT over 1..8 workers to minimise
    busiest worker + 2 s per worker.
 
