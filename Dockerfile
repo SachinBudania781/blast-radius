@@ -29,6 +29,7 @@ ENV BR_SRC=/app/sqlglot \
     OPENBLAS_NUM_THREADS=1 \
     OMP_NUM_THREADS=1 \
     MKL_NUM_THREADS=1 \
-    BR_DUCK_CACHE=/app/cache/duck.pkl
+    BR_DUCK_CACHE=/app/cache/duck.pkl \
+    BR_CDIAG=1
 
 CMD ["python", "/app/app/selector.py"]
