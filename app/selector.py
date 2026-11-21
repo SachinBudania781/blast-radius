@@ -572,6 +572,76 @@ def pack(tests, ms):
 
 
 # ---------------------------------------------------------------- verification
+def _plan_one(c, ms, est, meta, tests, maps, all_tests):
+    """Decide what to run for one commit; True if it needs a test child."""
+    if c.unknown:
+        c.result = set(all_tests)
+        return False
+    c.sure = {t for t in c.sure if ms[t] < 3000}
+    if VERIFY_ALL:
+        c.sure = set()  # measurement mode: run everything we would include unverified
+    cand = c.cands - c.always - c.sure
+    # cheap: recorded or our own measured run time under 1 s (some "slow" tests only pay
+    # for a process pool or class setup in the recorded run)
+    cheap = {t for t in cand if ms[t] < EXPENSIVE * 1000 or est[t] < EXPENSIVE * 1000}
+    tf = getattr(c, "tpc_filter", None)
+    run_ms = {}
+    if tf and not getattr(c, "tpc_filter_bad", False) and not any(p.endswith(".py") for p in c.patched) and not c.deleted:
+        # executor tests only re-run the edited TPC queries: cheap to check
+        ex = {t for t in cand if meta[t][1] == "tests/test_executor.py"}
+        cheap |= ex
+        nq = sum(len(v) for v in tf.values())
+        for t in ex:
+            if meta[t][3] in ("test_execute_tpcds", "test_execute_tpch", "test_optimized_tpch"):
+                run_ms[t] = ms[t] * min(1.0, (nq + 1) / 20.0)
+    else:
+        c.tpc_filter = None
+        oflt, ofrac = opt_query_filter(c, maps, meta)
+        if oflt is not None:
+            c.opt_filter = oflt
+            for x, f in ofrac.items():
+                run_ms[x] = ms[x] * f + 30
+                if x in cand and run_ms[x] < EXPENSIVE * 1000:
+                    cheap.add(x)
+        lists, frac = tpc_query_filter(c, maps, meta)
+        if lists is not None:
+            c.tpc_filter = {k: v for k, v in lists.items()}
+            for x, f in frac.items():
+                run_ms[x] = ms[x] * f + 150
+                if run_ms[x] < 500:
+                    cheap.add(x)
+            c.run_ms = run_ms
+    exp_ = cand - cheap
+    c.cheap, c.exp = cheap, exp_
+    c.run_ms = run_ms
+    c.cpu_cost = {x: est[x] * (run_ms[x] / ms[x] if x in run_ms and ms[x] > 0 else 1.0) for x in exp_}
+    # cheap stand-ins for the slowest tests, run after the cheap ones
+    # (not when the test's own file is edited: the stand-in would not see the edit)
+    c.probes = [] if VERIFY_ALL else [
+        (x, tests[x]["id"]) for x in sorted(exp_)
+        if tests[x]["id"] in PROBE_IDS and tests[x]["file"] not in c.patched and tests[x]["file"] not in c.deleted
+    ]
+    run_cost = sum(
+        est[t] * (run_ms[t] / ms[t] if t in run_ms else 1.0) if ms[t] >= EXPENSIVE * 1000 else policy.CPU_RATIO * run_ms.get(t, ms[t])
+        for t in cheap
+    )
+    if not VERIFY_ALL and cheap and run_cost > policy.pack_cost(cheap | exp_ | c.sure | c.always, ms):
+        # running them would cost more than just including them
+        c.guard = True
+        if not c.import_check:
+            c.result = cheap | exp_ | c.sure | c.always
+            return False
+        # but first make sure the patched modules import (else far more tests fail)
+        c.include_all_after_import = cheap | exp_
+        c.cheap, c.exp = set(), set()
+        c.probes = []
+    if not cheap and not exp_ and not c.import_check:
+        c.result = set(c.always) | c.sure
+        return False
+    return True
+
+
+
 def main():
     t_start = time.time()
     tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
@@ -615,77 +685,22 @@ def main():
     all_tests = set(range(ntests))
 
     # plan
-    jobs = []
-    for c in commits:
-        if c.unknown:
-            c.result = set(all_tests)
-            continue
-        c.sure = {t for t in c.sure if ms[t] < 3000}
-        if VERIFY_ALL:
-            c.sure = set()  # measurement mode: run everything we would include unverified
-        cand = c.cands - c.always - c.sure
-        # cheap: recorded or our own measured run time under 1 s (some "slow" tests only pay
-        # for a process pool or class setup in the recorded run)
-        cheap = {t for t in cand if ms[t] < EXPENSIVE * 1000 or est[t] < EXPENSIVE * 1000}
-        tf = getattr(c, "tpc_filter", None)
-        run_ms = {}
-        if tf and not getattr(c, "tpc_filter_bad", False) and not any(p.endswith(".py") for p in c.patched) and not c.deleted:
-            # executor tests only re-run the edited TPC queries: cheap to check
-            ex = {t for t in cand if meta[t][1] == "tests/test_executor.py"}
-            cheap |= ex
-            nq = sum(len(v) for v in tf.values())
-            for t in ex:
-                if meta[t][3] in ("test_execute_tpcds", "test_execute_tpch", "test_optimized_tpch"):
-                    run_ms[t] = ms[t] * min(1.0, (nq + 1) / 20.0)
-        else:
-            c.tpc_filter = None
-            oflt, ofrac = opt_query_filter(c, maps, meta)
-            if oflt is not None:
-                c.opt_filter = oflt
-                for x, f in ofrac.items():
-                    run_ms[x] = ms[x] * f + 30
-                    if x in cand and run_ms[x] < EXPENSIVE * 1000:
-                        cheap.add(x)
-            lists, frac = tpc_query_filter(c, maps, meta)
-            if lists is not None:
-                c.tpc_filter = {k: v for k, v in lists.items()}
-                for x, f in frac.items():
-                    run_ms[x] = ms[x] * f + 150
-                    if run_ms[x] < 500:
-                        cheap.add(x)
-                c.run_ms = run_ms
-        exp_ = cand - cheap
-        c.cheap, c.exp = cheap, exp_
-        c.run_ms = run_ms
-        c.cpu_cost = {x: est[x] * (run_ms[x] / ms[x] if x in run_ms and ms[x] > 0 else 1.0) for x in exp_}
-        # cheap stand-ins for the slowest tests, run after the cheap ones
-        # (not when the test's own file is edited: the stand-in would not see the edit)
-        c.probes = [] if VERIFY_ALL else [
-            (x, tests[x]["id"]) for x in sorted(exp_)
-            if tests[x]["id"] in PROBE_IDS and tests[x]["file"] not in c.patched and tests[x]["file"] not in c.deleted
-        ]
-        run_cost = sum(
-            est[t] * (run_ms[t] / ms[t] if t in run_ms else 1.0) if ms[t] >= EXPENSIVE * 1000 else policy.CPU_RATIO * run_ms.get(t, ms[t])
-            for t in cheap
-        )
-        if not VERIFY_ALL and cheap and run_cost > policy.pack_cost(cheap | exp_ | c.sure | c.always, ms):
-            # running them would cost more than just including them
-            c.guard = True
-            if not c.import_check:
-                c.result = cheap | exp_ | c.sure | c.always
-                continue
-            # but first make sure the patched modules import (else far more tests fail)
-            c.include_all_after_import = cheap | exp_
-            c.cheap, c.exp = set(), set()
-            c.probes = []
-        if not cheap and not exp_ and not c.import_check:
-            c.result = set(c.always) | c.sure
-            continue
-        jobs.append(c)
+    jobs = [c for c in commits if _plan_one(c, ms, est, meta, tests, maps, all_tests)]
 
     ids = [t["id"] for t in tests]
     for c in jobs:
         c.early_blind = None if (VERIFY_ALL or c.probes) else policy.early_stop_ok(c.cheap, c.exp, ms, ids, getattr(c, "run_ms", None), c.dedicated, getattr(c, "cpu_cost", None))
+        c.early_gate = None
+        if c.early_blind is None and not VERIFY_ALL and not c.probes and not any(p.startswith(EXEC_SIDE) for p in set(c.patched) | set(c.deleted)):
+            # stop early once test_execute_tpch or the optimizer's test_tpch (run first) fails: the
+            # TPC-DS run then fails too (44/44, 55/56)
+            ex = _num(ids, EXEC_TPCDS)
+            gates = {g for g in (_num(ids, EXEC_TPCH), _num(ids, OPT_TPCH)) if g in c.cheap}
+            if ex in c.exp and gates:
+                # (when it fails the change is broad: the rest is decided as catastrophic)
+                b_cat, v_cat = policy.decide(c.exp, set(), "cat", len(c.cheap), ms, ids, getattr(c, "run_ms", None), c.dedicated, pmap={ex: 0.97}, cpu=getattr(c, "cpu_cost", None))
+                if ex in b_cat and not v_cat and policy.pack_cost(set(c.cheap) | b_cat, ms) - policy.pack_cost(b_cat, ms) <= 300:
+                    c.early_blind, c.early_gate = b_cat, gates
     try:
         run_jobs(jobs, meta, ms, maps, ids)
     except BaseException as e:  # noqa: BLE001
@@ -877,6 +892,10 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
                     tl = [meta[t] for t in sorted(tests)]  # collection order (validation runs)
                 else:
                     tl = [meta[t] for t in sorted(tests, key=lambda t: (_z.crc32(f"{meta[t][1]}::{meta[t][2]}".encode()), meta[t][1], meta[t][2]))]
+                gate = (getattr(c, "early_gate", None) or set()) if phase == 1 else set()
+                if gate:
+                    first = [meta[g] for g in sorted(gate) if g in tests]
+                    tl = first + [m for m in tl if m[0] not in gate]  # their files and classes run first
                 tm = float(os.environ.get("BR_TIMEOUT_MULT", "5"))
                 timeouts = {t: min(float(os.environ.get("BR_TIMEOUT_CAP", "45")), max(5.0, ms[t] / 1000 * tm + 3)) for t in tests}
                 runner.TPC_FILTER = getattr(c, "tpc_filter", None)
@@ -951,7 +970,12 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
                             except OSError:
                                 pass
                             done = True
-                    if c.phase == 1 and getattr(c, "early_blind", None) and (b" 1\n" in buf.replace(b"-3 ready\n", b"") or b"-1 " in buf or b"-2 " in buf):
+                    gate = getattr(c, "early_gate", None)
+                    if gate:
+                        hit = any((b"\n" + buf).find(f"\n{g} 1\n".encode()) >= 0 for g in gate) or b"-1 " in buf or b"-2 " in buf
+                    else:
+                        hit = b" 1\n" in buf.replace(b"-3 ready\n", b"") or b"-1 " in buf or b"-2 " in buf
+                    if c.phase == 1 and getattr(c, "early_blind", None) and hit:
                         # live change and a big test goes on its own worker anyway: stop here
                         c.early_stopped = True
                         try:

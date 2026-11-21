@@ -145,16 +145,21 @@ def verify_cpu(x, ms, run_ms=None, cpu=None):
     return CPU_RATIO * (run_ms or {}).get(x, ms[x])
 
 
-def early_stop_ok(cheap, exp_tests, ms, ids, run_ms=None, dedicated=frozenset(), cpu=None):
+def early_stop_ok(cheap, exp_tests, ms, ids, run_ms=None, dedicated=frozenset(), cpu=None, force=None):
     """Stop running cheap tests at the first failure when the expensive decisions would be
     the same whether the change turns out broad or narrow, a big test goes on its own
     worker either way, and all cheap candidates fit next to it."""
     if not exp_tests or not cheap:
         return None
-    b_cat, v_cat = decide(exp_tests, set(), "cat", len(cheap), ms, ids, run_ms, dedicated, cpu=cpu)
-    b_broad, v_broad = decide(exp_tests, set(), "broad", len(cheap), ms, ids, run_ms, dedicated, cpu=cpu)
-    b_narrow, v_narrow = decide(exp_tests, set(), "narrow", len(cheap), ms, ids, run_ms, dedicated, cpu=cpu)
-    if not b_narrow or not (b_cat == b_broad == b_narrow) or not (v_cat == v_broad == v_narrow):
+    f = dict(force or {})
+    b_cat, v_cat = decide(exp_tests, set(), "cat", len(cheap), ms, ids, run_ms, dedicated, pmap=f or None, cpu=cpu)
+    b_broad, v_broad = decide(exp_tests, set(), "broad", len(cheap), ms, ids, run_ms, dedicated, pmap=f or None, cpu=cpu)
+    b_narrow, v_narrow = decide(exp_tests, set(), "narrow", len(cheap), ms, ids, run_ms, dedicated, pmap=f or None, cpu=cpu)
+    # after the cheap tests, class signals and proxies (test_execute_tpch for the TPC-DS run)
+    # can make a big test unlikely to fail: stop early only if it is added even then
+    low = {x: f.get(x, 0.02) for x in exp_tests}
+    b_low, v_low = decide(exp_tests, set(), "narrow", len(cheap), ms, ids, run_ms, dedicated, pmap=low, cpu=cpu)
+    if not b_narrow or not (b_cat == b_broad == b_narrow == b_low) or not (v_cat == v_broad == v_narrow == v_low):
         return None
     full = pack_cost(set(cheap) | b_narrow, ms)
     lean = pack_cost(b_narrow, ms)
