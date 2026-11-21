@@ -45,6 +45,11 @@ packed onto the cheapest number of workers.
    The slowest test has a cheap stand-in that runs its own checks in the child:
    `test_max_nodes` (the same node-limit checks at 1/100 scale). A failed stand-in includes the
    test; a passed one leaves it out. Not used when the test's own file is edited.
+   DuckDB answers: `TestExecutor` compares sqlglot's executor with DuckDB on the TPC queries.
+   DuckDB's answer depends only on the SQL text it receives, so the build runs DuckDB once on
+   the texts the pinned commit sends (`build/precompute_duck.py`); at run time an identical
+   text gets that stored answer and any other text still runs DuckDB (test_execute_tpcds
+   33 s -> 12.7 s CPU, test_optimized_tpch 4.5 s -> 0.2 s).
    Imported objects are frozen out of the cyclic GC (parent before forking, child after
    importing the test modules), which cuts collection work during tests.
 4. Output: the failing tests, packed by LPT over 1..8 workers to minimise
