@@ -33,7 +33,8 @@ MAPS = os.environ.get("BR_MAPS", os.path.join(os.path.dirname(APP), "maps"))
 TMP = os.environ.get("BR_TMP", "/tmp")
 PAR = int(os.environ.get("BR_PAR", "2"))
 DEBUG = os.environ.get("BR_DEBUG") == "1"
-VERIFY_ALL = os.environ.get("BR_VERIFY_ALL") == "1"  # measurement mode (never include unverified, except catastrophic)
+VERIFY_ALL = os.environ.get("BR_VERIFY_ALL") == "1"
+DIAG = os.environ.get("BR_DIAG") == "1"  # measurement build: encode where unverified tests were wasted  # measurement mode (never include unverified, except catastrophic)
 
 # tests with a cheap stand-in in runner.PROBES
 PROBE_IDS = ("tests/test_generator.py::TestGenerator::test_generator_memory", "tests/test_parser.py::TestParser::test_max_nodes")
@@ -669,6 +670,7 @@ def main():
         )
         if not VERIFY_ALL and cheap and run_cost > policy.pack_cost(cheap | exp_ | c.sure | c.always, ms):
             # running them would cost more than just including them
+            c.guard = True
             if not c.import_check:
                 c.result = cheap | exp_ | c.sure | c.always
                 continue
@@ -692,7 +694,7 @@ def main():
             if c.result is None:
                 c.result = set(c.cands) | set(c.sure) | set(c.always) | set(getattr(c, "blind", ()))
 
-    out = sys.stdout
+    outs = []
     for c in commits:
         res = c.result if c.result is not None else set(c.cands) | c.always | c.sure
         res = {t for t in res if isinstance(t, int) and 0 <= t < ntests}
@@ -700,6 +702,14 @@ def main():
             workers = pack(sorted(res), ms)
         except Exception:  # noqa: BLE001
             workers = [sorted(res)] if res else []
+        outs.append((c, res, workers))
+    if DIAG:
+        try:
+            _diag(outs, tests, meta, ms, maps, ids)
+        except Exception as e:  # noqa: BLE001
+            log("diag failed", repr(e))
+    out = sys.stdout
+    for c, res, workers in outs:
         out.write(json.dumps({"commit": c.cid, "workers": workers}, separators=(",", ":")) + "\n")
     out.flush()
     if DEBUG:
@@ -709,6 +719,79 @@ def main():
 
 
 _MAPS = None
+
+
+def _diag(outs, tests, meta, ms, maps, ids):
+    """Measurement build: run every test we included without running it, and encode in the
+    output (extra one-test workers: +2 s each, decimals from empty commits) how much of the
+    simulated time was wasted on tests that passed:
+      0.001 per commit with a wasted test_execute_tpcds, 0.010 per 2 s wasted on fixture
+      readers (sure); extra 0-second workers: 1 per 2 s wasted on other tests, 20 per 4 s
+      wasted in commits included whole without running ("guard")."""
+    ex_id = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+    djobs = []
+    for c, res, workers in outs:
+        if c.unknown or not res:
+            continue
+        known = set(getattr(c, "failed", set())) & set(getattr(c, "reported", set()))
+        u = set(res) - known
+        if not u:
+            continue
+        d = Commit(c.cid)
+        d.patched, d.deleted = c.patched, c.deleted
+        d.cheap, d.exp, d.sure, d.always = set(u), set(), set(), set()
+        d.import_check, d.import_fail_sets, d.probes, d.early_blind = set(), {}, [], None
+        for k in ("tpc_filter", "opt_filter", "run_ms"):
+            setattr(d, k, getattr(c, k, None))
+        d.orig, d.u, d.res = c, u, res
+        djobs.append(d)
+    run_jobs(djobs, meta, ms, maps, ids)
+    n_a, w_s, w_x, w_g = 0, 0.0, 0.0, 0.0
+    for d in djobs:
+        wasted = d.u - set(d.failed)
+        if not wasted:
+            continue
+        c, res = d.orig, d.res
+        full = policy.pack_cost(res, ms)
+        if getattr(c, "guard", False):
+            w_g += (full - policy.pack_cost(res - wasted, ms)) / 1000
+            log(f"diag {c.cid} guard wasted={len(wasted)}/{len(res)} {(full - policy.pack_cost(res - wasted, ms)) / 1000:.1f}s")
+            continue
+        ws = wasted & set(c.sure)
+        wx = wasted - ws
+        if any(ids[t] == ex_id for t in wasted):
+            n_a += 1
+            wx = {t for t in wx if ids[t] != ex_id}
+        w_s += (full - policy.pack_cost(res - ws, ms)) / 1000 if ws else 0
+        w_x += (full - policy.pack_cost(res - wx, ms)) / 1000 if wx else 0
+        log(f"diag {c.cid} wasted={len(wasted)} sure={len(ws)} other={sorted(ids[t].rsplit('::', 1)[-1] for t in wx)[:8]} ex={any(ids[t] == ex_id for t in wasted)}")
+    n_a = min(n_a, 9)
+    n_s = min(int(round(w_s / 2)), 9)
+    n_x = min(int(round(w_x / 2)), 19)
+    n_c = min(int(round(w_g / 4)), 9)
+    log(f"diag totals n_a={n_a} w_s={w_s:.1f} w_x={w_x:.1f} w_g={w_g:.1f} -> {n_a} {n_s} {n_x} {n_c}")
+    pool = {}
+    for t in tests:
+        pool.setdefault(t["seconds"], []).append(t["number"])
+    empties = [o for o in outs if not o[2]]
+    decimals = [0.001] * n_a + [0.010] * n_s
+    for o, sec in zip(empties, decimals):
+        cand = [x for x in pool.get(sec, []) if x not in o[1]]
+        if cand:
+            o[2].append([cand[0]])
+    zeros = n_x + 20 * n_c
+    for o in outs:
+        if zeros <= 0:
+            break
+        used = {x for w in o[2] for x in w}
+        for x in pool.get(0.0, []):
+            if zeros <= 0 or len(o[2]) >= 8:
+                break
+            if x in o[1] or x in used:
+                continue
+            o[2].append([x])
+            used.add(x)
+            zeros -= 1
 
 
 def run_jobs(jobs, meta, ms, maps, ids=None):
