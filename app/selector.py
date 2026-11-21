@@ -33,6 +33,7 @@ MAPS = os.environ.get("BR_MAPS", os.path.join(os.path.dirname(APP), "maps"))
 TMP = os.environ.get("BR_TMP", "/tmp")
 PAR = int(os.environ.get("BR_PAR", "2"))
 DEBUG = os.environ.get("BR_DEBUG") == "1"
+VERIFY_ALL = os.environ.get("BR_VERIFY_ALL") == "1"  # measurement mode (never include unverified, except catastrophic)
 
 EXPENSIVE = 1.0  # recorded seconds at or above which a test is "expensive"
 # wall-clock budget for the whole batch (the scorer allows 180 s for ~40 commits, 270 s for ~60)
@@ -611,6 +612,8 @@ def main():
             c.result = set(all_tests)
             continue
         c.sure = {t for t in c.sure if ms[t] < 3000}
+        if VERIFY_ALL:
+            c.sure = set()  # measurement mode: run everything we would include unverified
         cand = c.cands - c.always - c.sure
         cheap = {t for t in cand if ms[t] < EXPENSIVE * 1000}
         tf = getattr(c, "tpc_filter", None)
@@ -643,7 +646,7 @@ def main():
         exp_ = cand - cheap
         c.cheap, c.exp = cheap, exp_
         c.run_ms = run_ms
-        if cheap and policy.CPU_RATIO * sum(run_ms.get(t, ms[t]) for t in cheap) > policy.pack_cost(cheap | exp_ | c.sure | c.always, ms):
+        if not VERIFY_ALL and cheap and policy.CPU_RATIO * sum(run_ms.get(t, ms[t]) for t in cheap) > policy.pack_cost(cheap | exp_ | c.sure | c.always, ms):
             # running them would cost more than just including them
             if not c.import_check:
                 c.result = cheap | exp_ | c.sure | c.always
@@ -658,7 +661,7 @@ def main():
 
     ids = [t["id"] for t in tests]
     for c in jobs:
-        c.early_blind = policy.early_stop_ok(c.cheap, c.exp, ms, ids, getattr(c, "run_ms", None), c.dedicated)
+        c.early_blind = None if VERIFY_ALL else policy.early_stop_ok(c.cheap, c.exp, ms, ids, getattr(c, "run_ms", None), c.dedicated)
     try:
         run_jobs(jobs, meta, ms, maps, ids)
     except BaseException as e:  # noqa: BLE001
@@ -922,6 +925,9 @@ def _next_phase(c, ms, ids):
         b2, v2 = policy.decide(fx, base | blind, "unknown", n_cheap, ms, ids, getattr(c, "run_ms", None), c.dedicated)
         blind |= b2
         verify |= v2
+    if VERIFY_ALL and regime != "cat":
+        verify |= blind
+        blind = set()
     c.blind = blind
     return verify or None
 
