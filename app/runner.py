@@ -267,7 +267,7 @@ def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patc
         if modname.endswith(".__init__"):
             modname = modname[: -len(".__init__")]
         try:
-            signal.setitimer(signal.ITIMER_REAL, 30.0)
+            signal.setitimer(signal.ITIMER_REAL, float(os.environ.get("BR_IMPORT_TIMEOUT", "60")))
             __import__(modname)
             signal.setitimer(signal.ITIMER_REAL, 0)
         except BaseException:
@@ -336,7 +336,7 @@ def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patc
     for file, items in by_file.items():
         modname = file[:-3].replace("/", ".")
         try:
-            signal.setitimer(signal.ITIMER_REAL, 30.0)
+            signal.setitimer(signal.ITIMER_REAL, float(os.environ.get("BR_IMPORT_TIMEOUT", "60")))
             mod = __import__(modname, fromlist=["_"])
             signal.setitimer(signal.ITIMER_REAL, 0)
             if modname == "tests.test_executor":

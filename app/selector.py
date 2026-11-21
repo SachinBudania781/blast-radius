@@ -550,7 +550,9 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
     def launch(c, tests, phase):
         nonlocal seq
         seq += 1
-        ov = os.path.join(TMP, f"w{seq}")
+        ov = os.path.join(TMP, f"w{os.getpid()}_{seq}")
+        if os.path.lexists(ov):
+            _cleanup(ov)
         try:
             r, w = os.pipe()
             pid = os.fork()
