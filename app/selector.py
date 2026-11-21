@@ -39,6 +39,7 @@ PDIAG = os.environ.get("BR_PDIAG") == "1"  # measurement build: why was a passin
 CDIAG = os.environ.get("BR_CDIAG") == "1"  # measurement build: where the CPU goes
 CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "1.25"))  # scoring machine CPU / ours (measured tests)
 GEST = None
+GUARD_THETA = float(os.environ.get("BR_GUARD_THETA", "0.8"))  # running cheap tests still leaves their failures to include
 CPU_BY_PHASE = {}  # measurement build: encode where unverified tests were wasted  # measurement mode (never include unverified, except catastrophic)
 
 # tests with a cheap stand-in in runner.PROBES
@@ -631,7 +632,7 @@ def _plan_one(c, ms, est, meta, tests, maps, all_tests):
         gest[t] * (run_ms[t] / ms[t] if t in run_ms else 1.0) if ms[t] >= EXPENSIVE * 1000 else policy.CPU_RATIO * run_ms.get(t, ms[t])
         for t in cheap
     )
-    if not VERIFY_ALL and cheap and run_cost > policy.pack_cost(cheap | exp_ | c.sure | c.always, ms):
+    if not VERIFY_ALL and cheap and run_cost > GUARD_THETA * policy.pack_cost(cheap | exp_ | c.sure | c.always, ms):
         # running them would cost more than just including them
         c.guard = True
         if not c.import_check:
