@@ -389,6 +389,64 @@ def _tpcq():
     return _TPCQ
 
 
+_OPTQ = None
+
+
+def _optq():
+    global _OPTQ
+    if _OPTQ is None:
+        try:
+            _OPTQ = marshal.load(open(os.path.join(MAPS, "optq.m"), "rb"))
+        except Exception:
+            _OPTQ = {}
+    return _OPTQ
+
+
+def _line_mask(c, maps, x, idx, nruns):
+    allmask = (1 << nruns) - 1
+    m = 0
+    for rel, lines, structural in c.line_changes:
+        if structural:
+            return allmask
+        fidx = idx.get(rel, {})
+        info = maps.file(rel)
+        for ln in lines:
+            if ln in fidx:
+                m |= fidx[ln]
+            elif info is not None and 0 < ln < len(info[0]) and x in maps.set(info[0][ln]):
+                return allmask  # candidate through a non-query line (setup, class attribute, ...)
+    return m or allmask
+
+
+def opt_query_filter(c, maps, meta):
+    """Fixture-loop optimizer tests: which (fixture, index) queries a code-only change can affect.
+    Returns ({method_name: set((fname, i))}, {test: cost fraction}) or (None, None)."""
+    if not c.line_changes or c.deleted:
+        return None, None
+    for p in c.patched:
+        if not p.endswith(".py") or not p.startswith("sqlglot/"):
+            return None, None
+    oq = None
+    flt, frac = {}, {}
+    for x in c.cands:
+        if meta[x][1] != "tests/test_optimizer.py":
+            continue
+        if oq is None:
+            oq = _optq()
+        if x not in oq:
+            continue
+        runs, weights, idx = oq[x]
+        m = _line_mask(c, maps, x, idx, len(runs))
+        sel = [j for j in range(len(runs)) if m >> j & 1]
+        if len(sel) == len(runs):
+            continue
+        flt[meta[x][3]] = {tuple(runs[j]) for j in sel}
+        frac[x] = sum(weights[j] for j in sel)
+    if not flt:
+        return None, None
+    return flt, frac
+
+
 def tpc_query_filter(c, maps, meta):
     """For a code-only change, which TPC queries can change outcome. Returns
     ({list_key: set(indices)}, {test: fraction_of_cost}) or (None, None)."""
@@ -542,6 +600,13 @@ def main():
                     run_ms[t] = ms[t] * min(1.0, (nq + 1) / 20.0)
         else:
             c.tpc_filter = None
+            oflt, ofrac = opt_query_filter(c, maps, meta)
+            if oflt is not None:
+                c.opt_filter = oflt
+                for x, f in ofrac.items():
+                    run_ms[x] = ms[x] * f + 30
+                    if x in cand and run_ms[x] < EXPENSIVE * 1000:
+                        cheap.add(x)
             lists, frac = tpc_query_filter(c, maps, meta)
             if lists is not None:
                 c.tpc_filter = {k: v for k, v in lists.items()}
@@ -657,6 +722,7 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
                 tm = float(os.environ.get("BR_TIMEOUT_MULT", "5"))
                 timeouts = {t: min(float(os.environ.get("BR_TIMEOUT_CAP", "45")), max(5.0, ms[t] / 1000 * tm + 3)) for t in tests}
                 runner.TPC_FILTER = getattr(c, "tpc_filter", None)
+                runner.OPT_FILTER = getattr(c, "opt_filter", None)
                 runner.child_main(ov, tl, w, timeouts, 0, sorted(m for m in c.import_check if m.startswith("sqlglot/") or m.startswith("tests/")), set(c.patched) | set(c.deleted))
             except BaseException:
                 if os.environ.get("BR_CHILD_DEBUG"):

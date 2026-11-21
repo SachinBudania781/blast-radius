@@ -147,6 +147,22 @@ def precompute_executor_rows(src):
 
 
 TPC_FILTER = None  # {"tpc-h": set(indices), "tpc-ds": set(indices)} of edited fixture queries
+OPT_FILTER = None  # {test method name: set((fixture filename, index))} queries a change can affect
+CURRENT_TEST = [None]
+
+
+def _install_opt_filter(mod):
+    if not OPT_FILTER:
+        return
+    orig = mod.load_sql_fixture_pairs
+
+    def load_sql_fixture_pairs(filename):
+        allowed = OPT_FILTER.get(CURRENT_TEST[0])
+        for i, pair in enumerate(orig(filename)):
+            if allowed is None or (filename, i) in allowed:
+                yield pair
+
+    mod.load_sql_fixture_pairs = load_sql_fixture_pairs
 
 
 def _install_fast_executor_setup(mod, patched):
@@ -344,6 +360,7 @@ def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patc
 
         def startTest(self, test):
             super().startTest(test)
+            CURRENT_TEST[0] = getattr(test, "_testMethodName", None)
             num = getattr(test, "_br_num", None)
             self.cur = num
             t = timeouts.get(num, 10.0)
@@ -396,6 +413,8 @@ def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patc
             signal.setitimer(signal.ITIMER_REAL, 0)
             if modname == "tests.test_executor":
                 _install_fast_executor_setup(mod, patched)
+            if modname == "tests.test_optimizer":
+                _install_opt_filter(mod)
         except BaseException:
             signal.setitimer(signal.ITIMER_REAL, 0)
             out.write(f"{FAIL_ALL_IN_FILE} {file}\n")
