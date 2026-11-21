@@ -5,6 +5,13 @@ commit), run the cheap ones against the patched code to see which really fail, a
 print only the failing ones packed onto workers.
 """
 
+import os as _os
+
+# numeric libraries start one thread per visible host core on import; the scorer allows 256
+# processes+threads in total, so keep them single-threaded (results are identical)
+for _k in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_MAX_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    _os.environ.setdefault(_k, "1")
+
 import array
 import json
 import marshal
