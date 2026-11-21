@@ -40,7 +40,7 @@ CDIAG = os.environ.get("BR_CDIAG") == "1"  # measurement build: where the CPU go
 CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "1.25"))  # scoring machine CPU / ours (measured tests)
 GEST = None
 SLACK_KAPPA = float(os.environ.get("BR_SLACK", "0.5"))  # stop running cheap tests that fit next to the big unverified ones
-GUARD_THETA = float(os.environ.get("BR_GUARD_THETA", "1.0"))  # (0.8 cost +3.8 s on practice)
+GUARD_THETA = float(os.environ.get("BR_GUARD_THETA", "1.25"))  # (0.8 cost +3.8 s on practice)
 CPU_BY_PHASE = {}  # measurement build: encode where unverified tests were wasted  # measurement mode (never include unverified, except catastrophic)
 
 # tests with a cheap stand-in in runner.PROBES
