@@ -82,6 +82,28 @@ def _write(path, data):
     os.utime(path, (mt, mt))
 
 
+def _cap_duckdb_threads():
+    """The scorer allows 256 processes+threads; duckdb sizes its pool from the host's cores.
+    Two threads match the container's 2 CPUs and keep results the same."""
+    duckdb = sys.modules.get("duckdb")
+    if duckdb is None:
+        return
+    orig = duckdb.connect
+    if getattr(orig, "_br_capped", False):
+        return
+
+    def connect(*args, **kwargs):
+        cfg = dict(kwargs.pop("config", None) or {})
+        cfg.setdefault("threads", 2)
+        try:
+            return orig(*args, config=cfg, **kwargs)
+        except Exception:
+            return orig(*args, **kwargs)
+
+    connect._br_capped = True
+    duckdb.connect = connect
+
+
 PRE_ROWS = None
 
 
@@ -260,6 +282,7 @@ def child_main(overlay, tests, out_fd, timeouts, mem_limit, import_mods=(), patc
     import syncpool
 
     syncpool.install()
+    _cap_duckdb_threads()
     signal.signal(signal.SIGALRM, _on_alarm)
 
     for rel in import_mods:
