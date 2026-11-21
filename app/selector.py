@@ -1099,7 +1099,8 @@ def run_jobs(jobs, meta, ms, maps, ids=None):
                     if not done and c.phase == 1 and SLACK_KAPPA > 0 and not getattr(c, "early_cat", False):
                         n_now = buf.count(b"\n")
                         if n_now >= getattr(c, "slack_next", 30):
-                            c.slack_next = n_now + max(25, len(c.cheap) // 20)
+                            # a few checkpoints only (each decides the big tests twice: parent CPU)
+                            c.slack_next = n_now + max(25, len(c.cheap) // 4)
                             if _slack_stop(c, buf, ms, ids):
                                 try:
                                     os.kill(pid, 9)
@@ -1153,6 +1154,8 @@ def _slack_stop(c, buf, ms, ids):
     still to run costs less than running them. True: stop the child now."""
     if SLACK_KAPPA <= 0 or not c.exp or getattr(c, "early_blind", None) or getattr(c, "probes", None):
         return False
+    if b" 1\n" not in buf or max(ms[x] for x in c.exp) < 3000:
+        return False  # no failure yet, or no big test to make room beside
     rep, bad = set(), set()
     for line in buf.decode("utf-8", "replace").splitlines():
         a = line.split(" ")
