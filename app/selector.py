@@ -39,7 +39,7 @@ PDIAG = os.environ.get("BR_PDIAG") == "1"  # measurement build: why was a passin
 CDIAG = os.environ.get("BR_CDIAG") == "1"  # measurement build: where the CPU goes
 CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "1.25"))  # scoring machine CPU / ours (measured tests)
 GEST = None
-PERSIST = os.environ.get("BR_PERSIST", "1") == "1"  # phase 2 runs in the phase-1 child
+PERSIST = os.environ.get("BR_PERSIST", "0") == "1"  # phase 2 in the phase-1 child (off: +8 s CPU on practice)
 SLACK_KAPPA = float(os.environ.get("BR_SLACK", "0.5"))  # stop running cheap tests that fit next to the big unverified ones
 GUARD_THETA = float(os.environ.get("BR_GUARD_THETA", "1.0"))  # (0.8 cost +3.8 s on practice)
 CPU_BY_PHASE = {}  # measurement build: encode where unverified tests were wasted  # measurement mode (never include unverified, except catastrophic)

@@ -59,9 +59,7 @@ packed onto the cheapest number of workers.
    decided on what has run so far (and again assuming the rest pass); if some go in unverified
    either way and the cheap tests still to run fit beside them for less than half the CPU of
    running them, the child is stopped and those tests are included unrun.
-   Phase 2 (the expensive tests chosen for a run) goes to the phase-1 child over a pipe instead
-   of a new child, saving a fork and the imports (not for the TPC executor tests, whose data
-   the parent prepares before forking).
+   (Running phase 2 in the phase-1 child, `BR_PERSIST=1`, cost 8 s more CPU on practice: off.)
 4. Output: the failing tests, packed by LPT over 1..8 workers to minimise
    busiest worker + 2 s per worker.
 
