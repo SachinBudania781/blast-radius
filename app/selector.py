@@ -37,7 +37,7 @@ VERIFY_ALL = os.environ.get("BR_VERIFY_ALL") == "1"
 DIAG = os.environ.get("BR_DIAG") == "1"
 PDIAG = os.environ.get("BR_PDIAG") == "1"  # measurement build: why was a passing TPC-DS run added
 CDIAG = os.environ.get("BR_CDIAG") == "1"  # measurement build: where the CPU goes
-CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "1.25"))  # scoring machine CPU / ours (measured tests)
+CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "1.5"))  # scoring machine CPU / ours (measured tests)
 GEST = None
 PERSIST = os.environ.get("BR_PERSIST", "0") == "1"  # phase 2 in the phase-1 child (off: +8 s CPU on practice)
 SLACK_KAPPA = float(os.environ.get("BR_SLACK", "0.5"))  # stop running cheap tests that fit next to the big unverified ones
